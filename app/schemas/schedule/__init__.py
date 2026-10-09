@@ -1,0 +1,1 @@
+# Schedule schema package initialization

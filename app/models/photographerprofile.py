@@ -25,4 +25,5 @@ class PhotographerProfile(Base):
     services: Mapped[List["PhotographerService"]] = relationship(back_populates="photographer", cascade="all, delete-orphan")
     schedule_templates: Mapped[List["ScheduleTemplate"]] = relationship(back_populates="photographer", cascade="all, delete-orphan")
     schedule_exceptions: Mapped[List["ScheduleException"]] = relationship(back_populates="photographer", cascade="all, delete-orphan")
+    schedule_blocks: Mapped[List["ScheduleBlock"]] = relationship(back_populates="photographer", cascade="all, delete-orphan")
     order_items: Mapped[List["OrderItem"]] = relationship(back_populates="photographer")

@@ -24,4 +24,5 @@ class StudioRoom(Base):
     studio: Mapped["StudioProfile"] = relationship(back_populates="rooms")
     schedule_templates: Mapped[List["ScheduleTemplate"]] = relationship(back_populates="room", cascade="all, delete-orphan")
     schedule_exceptions: Mapped[List["ScheduleException"]] = relationship(back_populates="room", cascade="all, delete-orphan")
+    schedule_blocks: Mapped[List["ScheduleBlock"]] = relationship(back_populates="room", cascade="all, delete-orphan")
     order_items: Mapped[List["OrderItem"]] = relationship(back_populates="studio_room")
