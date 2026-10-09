@@ -220,7 +220,7 @@ PicNest/
 ### Регистрация нового пользователя
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/auth/register \
+curl -X POST https://picnest.ru/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "photographer@example.com",
@@ -237,7 +237,7 @@ curl -X POST http://localhost:8000/api/v1/auth/register \
 ### Вход в систему и получение токена
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/auth/login \
+curl -X POST https://picnest.ru/api/v1/auth/login \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "username=photographer@example.com&password=secure_password_123"
 ```
@@ -245,7 +245,7 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
 ### Создание недельного шаблона расписания (фотографу)
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/schedules/templates \
+curl -X POST https://picnest.ru/api/v1/schedules/templates \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -260,7 +260,7 @@ curl -X POST http://localhost:8000/api/v1/schedules/templates \
 ### Создание исключения (выходной день)
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/schedules/exceptions \
+curl -X POST https://picnest.ru/api/v1/schedules/exceptions \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -274,7 +274,7 @@ curl -X POST http://localhost:8000/api/v1/schedules/exceptions \
 ### Блокировка слота (для зала студии)
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/schedules/blocks \
+curl -X POST https://picnest.ru/api/v1/schedules/blocks \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -291,15 +291,11 @@ curl -X POST http://localhost:8000/api/v1/schedules/blocks \
 При возникновении проблем или вопросов:
 
 - **GitHub Issues:** [github.com/picnest/picnest/issues](https://github.com/picnest/picnest/issues)
-- **Email:** support@picnest.com
 - **Документация:** [docs/](docs/)
 
-## 📝 Лицензия
-
-PicNest Marketplace © 2024. Все права защищены.
 
 ---
 
 **Версия API:** 1.0.0  
 **Последнее обновление:** Октябрь 2026  
-**Разработано:** Backend Team, PicNest Marketplace
+
