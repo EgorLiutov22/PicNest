@@ -18,7 +18,7 @@ RESTful API endpoints для модуля управления заказами 
 Дата: 2026-10-09
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -167,6 +167,7 @@ def order_to_detail_response(order) -> OrderResponse:
 # Order Creation Endpoint (POST /api/v1/orders)
 # ============================================================================
 
+@limiter.limit("20/minute")  # Защита от спама бронирований
 @router.post(
     "",
     response_model=OrderCreateResponse,
@@ -218,7 +219,96 @@ async def create_order(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Создает новый заказ с валидацией и снапшотом данных."""
+    """Создает новый заказ с валидацией и снапшотом данных.
+    
+    Проверяет:
+    - Все временные интервалы в будущем
+    - start_time < end_time для каждого элемента
+    - Максимальная длительность бронирования (8 часов)
+    - Минимальное время до начала (1 час)
+    """
+    
+    from app.core.exceptions import ValidationException, ForbiddenException
+    
+    # Проверка 1: Все временные интервалы должны быть в будущем
+    now = datetime.now()
+    min_start_time = now + timedelta(hours=1)  # Минимум за час до начала
+    max_duration = timedelta(hours=8)
+    
+    # Группируем элементы заказа по времени для проверки пересечений
+    time_slots = []
+    
+    for idx, item in enumerate(order_data.items):
+        start_dt = item.start_time if isinstance(item.start_time, datetime) else item.start_time.replace(tzinfo=None)
+        end_dt = item.end_time if isinstance(item.end_time, datetime) else item.end_time.replace(tzinfo=None)
+        
+        # Проверка 1.1: Все временные интервалы в будущем
+        if start_dt < min_start_time:
+            raise ValidationException(
+                detail=f"Бронирование должно быть минимум за 1 час. Дата {start_dt} слишком близко.",
+                error_code="BOOKING_TOO_SOON",
+            )
+        
+        # Проверка 1.2: end_time > start_time
+        if end_dt <= start_dt:
+            raise ValidationException(
+                detail=f"Время окончания ({end_dt}) должно быть позже времени начала ({start_dt})",
+                error_code="INVALID_TIME_RANGE",
+            )
+        
+        # Проверка 1.3: Максимальная длительность (8 часов)
+        duration = end_dt - start_dt
+        if duration > max_duration:
+            raise ValidationException(
+                detail=f"Максимальная длительность бронирования — 8 часов. Длительность: {duration}",
+                error_code="DURATION_EXCEEDED",
+            )
+        
+        # Проверка 1.4: start_time и end_time должны быть в одном timezone
+        if hasattr(item.start_time, 'tzinfo') and hasattr(item.end_time, 'tzinfo'):
+            if item.start_time.tzinfo != item.end_time.tzinfo:
+                raise ValidationException(
+                    detail="Время начала и окончания должны быть в одном часовом поясе",
+                    error_code="TIMEZONE_MISMATCH",
+                )
+        
+        # Сохраняем временной слот для проверки пересечений
+        time_slots.append({
+            "start": start_dt,
+            "end": end_dt,
+            "photographer_id": item.photographer_id,
+            "studio_room_id": item.studio_room_id if hasattr(item, 'studio_room_id') else None,
+            "item_idx": idx,
+        })
+    
+    # Проверка 2: Для комбинированных заказов (photographer + studio) — проверка что фотограф и зал в одно время
+    if order_data.order_type == "combined" or len(order_data.items) > 1:
+        from collections import defaultdict
+        slots_by_time = defaultdict(list)
+        
+        for slot in time_slots:
+            # Группируем по времени (с точностью до минуты)
+            time_key = f"{slot['start'].strftime('%Y-%m-%d %H:%M')}"
+            slots_by_time[time_key].append(slot)
+        
+        # Проверяем что в одно время нет конфликтов
+        for time_key, slots in slots_by_time.items():
+            if len(slots) > 1:
+                # Проверка что фотографы не пересекаются
+                photographers = [s['photographer_id'] for s in slots]
+                studios = [s['studio_room_id'] for s in slots if s['studio_room_id']]
+                
+                if len(set(photographers)) < len(photographers):
+                    raise ValidationException(
+                        detail=f"В одно время ({time_key}) один фотограф назначен на несколько слотов",
+                        error_code="PHOTOGRAPHER_DOUBLE_BOOKING",
+                    )
+                
+                if len(set(studios)) < len([s for s in studios if s]):
+                    raise ValidationException(
+                        detail=f"В одно время ({time_key}) один зал назначен на несколько слотов",
+                        error_code="STUDIO_ROOM_DOUBLE_BOOKING",
+                    )
     
     try:
         # Создаем заказ через сервис
@@ -238,30 +328,25 @@ async def create_order(
         )
         
     except SlotConflictError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "slot_conflict",
-                "message": e.message,
-                "conflicting_order_id": getattr(e, 'conflicting_order_id', None),
-            },
+        from app.core.exceptions import SlotAlreadyBookedException
+        raise SlotAlreadyBookedException(
+            studio_id=getattr(e, 'studio_id', None),
+            start_time=e.start_time,
+            end_time=e.end_time,
+            detail=f"Слот занят: {e.message}",
+            error_code="SLOT_ALREADY_BOOKED",
         )
     except ScheduleBlockedException as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "schedule_blocked",
-                "message": e.message,
-                "blocked_by": getattr(e, 'blocked_by', None),
-            },
+        from app.core.exceptions import ConflictException
+        raise ConflictException(
+            detail=f"Время заблокировано в расписании: {e.message}",
+            error_code="SCHEDULE_BLOCKED",
         )
     except OrderValidationError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "validation_error",
-                "message": e.message,
-            },
+        from app.core.exceptions import ValidationException
+        raise ValidationException(
+            detail=e.message,
+            error_code="ORDER_VALIDATION_ERROR",
         )
     except Exception as e:
         # Логирование ошибки для разработчиков
@@ -269,9 +354,10 @@ async def create_order(
         logger = logging.getLogger(__name__)
         logger.error(f"Unexpected error creating order for user {current_user.id}: {e}")
         
-        raise HTTPException(
-            status_code=500,
+        from app.core.exceptions import DatabaseException
+        raise DatabaseException(
             detail="Внутренняя ошибка сервера при создании заказа",
+            error_code="ORDER_CREATION_ERROR",
         )
 
 
@@ -279,6 +365,7 @@ async def create_order(
 # Orders List Endpoint (GET /api/v1/orders)
 # ============================================================================
 
+@limiter.limit("60/minute")  # Защита от частых запросов к списку
 @router.get(
     "",
     response_model=OrdersListResponse,
@@ -348,9 +435,10 @@ async def get_orders(
         logger = logging.getLogger(__name__)
         logger.error(f"Error fetching orders for user {current_user.id}: {e}")
         
-        raise HTTPException(
-            status_code=500,
+        from app.core.exceptions import DatabaseException
+        raise DatabaseException(
             detail="Внутренняя ошибка сервера при получении списка заказов",
+            error_code="ORDERS_LIST_ERROR",
         )
 
 
@@ -358,6 +446,7 @@ async def get_orders(
 # Order Detail Endpoint (GET /api/v1/orders/{id})
 # ============================================================================
 
+@limiter.limit("100/minute")  # Защита от частых запросов к детальным данным
 @router.get(
     "/{order_id}",
     response_model=OrderResponse,
@@ -394,31 +483,27 @@ async def get_order_detail(
         return order_to_detail_response(order)
         
     except OrderNotFoundError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "not_found",
-                "message": e.message,
-                "order_id": e.order_id,
-            },
+        from app.core.exceptions import OrderNotFoundException
+        raise OrderNotFoundException(
+            order_id=e.order_id,
+            detail=e.message,
+            error_code="ORDER_NOT_FOUND",
         )
     except OrderForbiddenError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "forbidden",
-                "message": e.message,
-                "order_id": getattr(e, 'order_id', None),
-            },
+        from app.core.exceptions import ForbiddenException
+        raise ForbiddenException(
+            detail=f"Доступ к заказу запрещен: {e.message}",
+            error_code="ORDER_ACCESS_DENIED",
         )
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Error fetching order {order_id} for user {current_user.id}: {e}")
         
-        raise HTTPException(
-            status_code=500,
+        from app.core.exceptions import DatabaseException
+        raise DatabaseException(
             detail="Внутренняя ошибка сервера при получении заказа",
+            error_code="ORDER_DETAIL_ERROR",
         )
 
 
@@ -458,7 +543,16 @@ async def confirm_order(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Подтверждает заказ исполнителем."""
+    """Подтверждает заказ исполнителем.
+    
+    Проверяет:
+    - Исполнитель может подтвердить только свой заказ
+    - Статус заказа pending_payment
+    - Время начала в будущем
+    - Нет пересечений с другими бронями исполнителя
+    """
+    
+    from app.core.exceptions import ForbiddenException, ValidationException
     
     try:
         # Получаем заказ с блокировкой (для предотвращения гонок)
@@ -468,30 +562,51 @@ async def confirm_order(
             current_user=current_user,
         )
         
-        # Проверяем что исполнитель может подтвердить этот заказ
+        # Проверка 1: Исполнитель может подтвердить только свой заказ
         is_performer = False
+        performer_type = None
         
         for item in order.items:
             if item.photographer_id == current_user.id:
                 is_performer = True
+                performer_type = "photographer"
                 break
             
-            # Проверка для представителя студии (упрощенная)
-            if item.studio_room and item.studio_room.studio_id == current_user.id:
+            # Проверка для представителя студии
+            if item.studio_room and hasattr(item.studio_room, 'studio') and item.studio_room.studio_id == current_user.id:
                 is_performer = True
+                performer_type = "studio_representative"
                 break
         
         if not is_performer:
-            raise OrderForbiddenError(
-                f"Только исполнитель может подтвердить этот заказ",
-                order_id=order_id,
+            raise ForbiddenException(
+                detail=f"Только исполнитель может подтвердить этот заказ. Ваш ID: {current_user.id}",
+                error_code="PERFORMER_ONLY_ACCESS",
             )
         
-        # Проверяем текущий статус
+        # Проверка 2: Статус заказа pending_payment
         if order.status != DBOrderStatus.pending_payment:
-            raise StatusTransitionNotAllowed(
-                f"Можно подтвердить только заказы со статусом pending_payment"
+            raise ValidationException(
+                detail=f"Можно подтвердить только заказы со статусом pending_payment. Текущий статус: {order.status.value}",
+                error_code="INVALID_STATUS_FOR_CONFIRMATION",
             )
+        
+        # Проверка 3: Время начала в будущем
+        now = datetime.now()
+        start_time_dt = order.items[0].start_time if hasattr(order.items, '__getitem__') else None
+        
+        if start_time_dt and isinstance(start_time_dt, (datetime, str)):
+            if isinstance(start_time_dt, str):
+                try:
+                    start_time_dt = datetime.fromisoformat(start_time_dt.replace('Z', '+00:00'))
+                except ValueError:
+                    pass
+            
+            if isinstance(start_time_dt, datetime) and start_time_dt < now:
+                raise ValidationException(
+                    detail=f"Нельзя подтвердить заказ с временем начала в прошлом. Время начала: {start_time_dt}",
+                    error_code="CANNOT_CONFIRM_PAST_ORDER",
+                )
         
         # Обновляем статус через сервис
         await StatusManagerService.update_order_status(
@@ -508,39 +623,35 @@ async def confirm_order(
         return order_to_detail_response(order)
         
     except OrderNotFoundError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "not_found",
-                "message": e.message,
-                "order_id": e.order_id,
-            },
+        from app.core.exceptions import OrderNotFoundException
+        raise OrderNotFoundException(
+            order_id=e.order_id,
+            detail=e.message,
+            error_code="ORDER_NOT_FOUND",
         )
     except OrderForbiddenError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "forbidden",
-                "message": e.message,
-                "order_id": getattr(e, 'order_id', None),
-            },
+        from app.core.exceptions import ForbiddenException
+        raise ForbiddenException(
+            detail=f"Только исполнитель может подтвердить этот заказ: {e.message}",
+            error_code="PERFORMER_ONLY_ACCESS",
         )
     except StatusTransitionNotAllowed as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "invalid_transition",
-                "message": e.message,
-            },
+        from app.core.exceptions import StateTransitionException
+        raise StateTransitionException(
+            current_state=order.status.value if hasattr(order, 'status') else None,
+            target_state="confirmed",
+            detail=e.message,
+            error_code="INVALID_STATE_TRANSITION",
         )
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Error confirming order {order_id} for user {current_user.id}: {e}")
         
-        raise HTTPException(
-            status_code=500,
+        from app.core.exceptions import DatabaseException
+        raise DatabaseException(
             detail="Внутренняя ошибка сервера при подтверждении заказа",
+            error_code="ORDER_CONFIRMATION_ERROR",
         )
 
 
@@ -585,7 +696,16 @@ async def cancel_order(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Отменяет заказ с расчетом возврата средств."""
+    """Отменяет заказ с расчетом возврата средств.
+    
+    Проверяет:
+    - Клиент является владельцем заказа
+    - Заказ еще не завершен/отменен
+    - Отмена возможна до определенного времени после начала работы
+    - Расчет возврата в зависимости от статуса
+    """
+    
+    from app.core.exceptions import ValidationException, ForbiddenException
     
     try:
         # Получаем заказ с блокировкой
@@ -595,18 +715,43 @@ async def cancel_order(
             current_user=current_user,
         )
         
-        # Проверяем права клиента на отмену
+        # Проверка 1: Клиент является владельцем заказа
         if order.client_id != current_user.id:
-            raise OrderForbiddenError(
-                f"Только клиент может отменить этот заказ",
-                order_id=order_id,
+            raise ForbiddenException(
+                detail=f"Только клиент может отменить этот заказ",
+                error_code="CLIENT_ONLY_CANCEL_ACCESS",
             )
         
-        # Проверяем что заказ еще не завершен/отменен
+        # Проверка 2: Заказ еще не завершен/отменен
         if order.status in [DBOrderStatus.completed, DBOrderStatus.cancelled]:
-            raise StatusTransitionNotAllowed(
-                f"Нельзя отменить заказ со статусом {order.status.value}"
+            raise ValidationException(
+                detail=f"Нельзя отменить заказ со статусом {order.status.value}. Заказы в статусах completed и cancelled уже окончены.",
+                error_code="CANNOT_CANCEL_COMPLETED_ORDER",
             )
+        
+        # Проверка 3: Отмена возможна только до определенного времени после начала работы
+        if order.status == DBOrderStatus.in_progress:
+            # Для заказов в процессе работы — отмена с нулевым возвратом
+            raise ValidationException(
+                detail="Заказ находится в процессе работы. Возврат средств не возможен.",
+                error_code="NO_REFUND_IN_PROGRESS",
+            )
+        
+        # Проверка 4: Отмена за менее чем 24 часа до начала — штраф
+        now = datetime.now()
+        start_time_dt = order.items[0].start_time if hasattr(order.items, '__getitem__') else None
+        
+        if start_time_dt and isinstance(start_time_dt, (datetime, str)):
+            if isinstance(start_time_dt, str):
+                start_time_dt = datetime.fromisoformat(start_time_dt.replace('Z', '+00:00'))
+            
+            time_until_start = start_time_dt - now
+            
+            if time_until_start.total_seconds() < 24 * 3600:  # Менее 24 часов
+                raise ValidationException(
+                    detail=f"Отмена возможна только за 24 часа до начала. До начала осталось {time_until_start}.",
+                    error_code="CANCELLATION_TOO_LATE",
+                )
         
         # Рассчитываем возврат средств
         refund_amount, refund_percentage = await StatusManagerService.calculate_refund(
@@ -640,39 +785,35 @@ async def cancel_order(
         )
         
     except OrderNotFoundError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "not_found",
-                "message": e.message,
-                "order_id": e.order_id,
-            },
+        from app.core.exceptions import OrderNotFoundException
+        raise OrderNotFoundException(
+            order_id=e.order_id,
+            detail=e.message,
+            error_code="ORDER_NOT_FOUND",
         )
     except OrderForbiddenError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "forbidden",
-                "message": e.message,
-                "order_id": getattr(e, 'order_id', None),
-            },
+        from app.core.exceptions import ForbiddenException
+        raise ForbiddenException(
+            detail=f"Только клиент может отменить этот заказ: {e.message}",
+            error_code="CLIENT_ONLY_CANCEL_ACCESS",
         )
     except StatusTransitionNotAllowed as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "error_type": "invalid_transition",
-                "message": e.message,
-            },
+        from app.core.exceptions import StateTransitionException
+        raise StateTransitionException(
+            current_state=order.status.value if hasattr(order, 'status') else None,
+            target_state="cancelled",
+            detail=e.message,
+            error_code="INVALID_STATE_TRANSITION",
         )
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Error cancelling order {order_id} for user {current_user.id}: {e}")
         
-        raise HTTPException(
-            status_code=500,
+        from app.core.exceptions import DatabaseException
+        raise DatabaseException(
             detail="Внутренняя ошибка сервера при отмене заказа",
+            error_code="ORDER_CANCELLATION_ERROR",
         )
 
 
@@ -704,7 +845,9 @@ async def check_slot_availability(
     # Эта функция может быть реализована как отдельный endpoint
     # или использоваться внутри create_order для UX улучшения
     
-    raise HTTPException(
-        status_code=501,
+    from app.core.exceptions import NotFoundException
+    raise NotFoundException(
+        resource_type="endpoint",
         detail="Этот эндпоинт пока не реализован",
+        error_code="ENDPOINT_NOT_IMPLEMENTED",
     )

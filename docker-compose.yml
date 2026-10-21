@@ -1,0 +1,218 @@
+# ============================================================================
+# PicNest Marketplace API - Docker Compose Configuration
+# ============================================================================
+# Конфигурация сервисов для разработки и продакшена
+# Сервисы: app, db (PostgreSQL), redis (опционально)
+# Автор: PicNest Backend Team
+# Дата: 2026-10-21
+# ============================================================================
+
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # FastAPI Application Service
+  # ==========================================================================
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: picnest/picnest-api:${IMAGE_TAG:-latest}
+    container_name: picnest-api
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://picnest_user:picnest_pass@db:5432/picnest_db}
+      - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-in-production}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      - REFRESH_TOKEN_EXPIRE_DAYS=${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:8080}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - PROMETHEUS_ENABLED=${PROMETHEUS_ENABLED:-true}
+      - DEBUG=${DEBUG:-false}
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    networks:
+      - picnest-network
+
+    deploy:
+      replicas: ${REPLICAS:-2}
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  # ==========================================================================
+  # PostgreSQL Database Service
+  # ==========================================================================
+
+  db:
+    image: postgres:14-alpine
+    container_name: picnest-db
+    restart: unless-stopped
+
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-picnest_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-picnest_pass}
+      - POSTGRES_DB=${POSTGRES_DB:-picnest_db}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+
+    ports:
+      - "5432:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-picnest_user} -d ${POSTGRES_DB:-picnest_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - picnest-network
+
+  # ==========================================================================
+  # Redis Service (для кэширования и rate limiting)
+  # ==========================================================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: picnest-redis
+    restart: unless-stopped
+
+    command: redis-server --appendonly yes
+
+    volumes:
+      - redis_data:/data
+
+    ports:
+      - "6379:6379"
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - picnest-network
+
+  # ==========================================================================
+  # PgAdmin (для управления базой данных) - опционально, только для development
+  # ==========================================================================
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: picnest-pgadmin
+    restart: unless-stopped
+
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD:-admin}
+
+    ports:
+      - "5050:80"
+
+    depends_on:
+      - db
+
+    networks:
+      - picnest-network
+
+  # ==========================================================================
+  # Prometheus (для метрик) - опционально, только для development/production monitoring
+  # ==========================================================================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: picnest-prometheus
+    restart: unless-stopped
+
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+    ports:
+      - "9090:9090"
+
+    depends_on:
+      - app
+
+    networks:
+      - picnest-network
+
+  # ==========================================================================
+  # Grafana (для дашбордов) - опционально, только для development/production monitoring
+  # ==========================================================================
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: picnest-grafana
+    restart: unless-stopped
+
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+    depends_on:
+      - prometheus
+
+    networks:
+      - picnest-network
+
+# ==========================================================================
+# Volumes для persistent data
+# ==========================================================================
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# ==========================================================================
+# Networks для изоляции сервисов
+# ==========================================================================
+
+networks:
+  picnest-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

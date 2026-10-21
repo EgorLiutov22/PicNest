@@ -7,3 +7,11 @@ python-jose[cryptography]>=3.3.0,<3.5.0
 passlib[bcrypt]>=1.7.4
 python-multipart>=0.0.6
 uvicorn[standard]>=0.24.0
+# Logging and Monitoring
+structlog>=24.1.0
+sentry-sdk>=1.39.0
+prometheus-fastapi-instrumentator>=6.1.0
+
+# Security - Rate limiting
+slowapi>=0.5.0
+redis>=5.0.0

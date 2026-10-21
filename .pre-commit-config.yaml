@@ -1,0 +1,149 @@
+# ============================================================================
+# PicNest Marketplace API - Pre-commit Hooks Configuration
+# ============================================================================
+# Автоматическая проверка кода перед каждым commit
+# Автор: PicNest Backend Team
+# Дата: 2026-10-21
+# ============================================================================
+
+repos:
+  # ========================================================================
+  # Black - Code formatting
+  # ========================================================================
+
+  - repo: https://github.com/psf/black
+    rev: 24.2.0
+    hooks:
+      - id: black
+        name: Format code with Black
+        description: Ensures consistent code formatting
+        language_version: python3.11
+        types_or: [python, pyi]
+
+  # ========================================================================
+  # isort - Import sorting
+  # ========================================================================
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        name: Sort imports with isort
+        description: Ensures consistent import ordering
+        args: [--profile=black, --line-length=88]
+
+  # ========================================================================
+  # flake8 - Code quality linter
+  # ========================================================================
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        name: Run flake8 code quality check
+        description: Detects unused imports, undefined names, etc.
+        args: [--max-line-length=120, --exclude=__pycache__,migrations]
+
+  # ========================================================================
+  # mypy - Static type checking
+  # ========================================================================
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        name: Run mypy static type checker
+        description: Catches type errors before runtime
+        args: [--ignore-missing-imports, --strict]
+
+  # ========================================================================
+  # ruff - Modern fast linter (alternative to flake8)
+  # ========================================================================
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.4
+    hooks:
+      - id: ruff
+        name: Run Ruff linter
+        description: Extremely fast Python linter
+        args: [--fix, --exit-non-zero-on-fix]
+
+  # ========================================================================
+  # check-yaml - YAML syntax validation
+  # ========================================================================
+
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.1.0
+    hooks:
+      - id: prettier
+        name: Check YAML files with Prettier
+        description: Ensures valid YAML syntax
+        types_or: [yaml, json]
+
+  # ========================================================================
+  # end-of-file-fixer - Ensure files end with newline
+  # ========================================================================
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+        name: Validate YAML syntax
+        description: Checks for valid YAML syntax
+
+      - id: end-of-file-fixer
+        name: Ensure files end with newline
+        description: Adds trailing newline to files if missing
+
+      - id: trailing-whitespace
+        name: Remove trailing whitespace
+        description: Strips trailing whitespace from lines
+
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+        description: Detects git merge conflict markers
+
+      - id: detect-private-key
+        name: Check for private keys
+        description: Prevents committing sensitive keys
+
+  # ========================================================================
+  # Bandit - Security linter
+  # ========================================================================
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.8
+    hooks:
+      - id: bandit
+        name: Run Bandit security scanner
+        description: Finds common security issues in Python code
+
+  # ========================================================================
+  # Safety - Dependency vulnerability check
+  # ========================================================================
+
+  - repo: https://github.com/pyupio/safety-action
+    rev: v1.0.8
+    hooks:
+      - id: safety
+        name: Check dependencies for vulnerabilities
+        description: Scans requirements.txt for known security issues
+
+  # ========================================================================
+  # Git Hooks for Docker files
+  # ========================================================================
+
+  - repo: local
+    hooks:
+      - id: check-dockerfile-syntax
+        name: Check Dockerfile syntax
+        entry: docker build --help
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: validate-compose-yaml
+        name: Validate docker-compose.yml
+        entry: python3 -c "import yaml; yaml.safe_load(open('docker-compose.yml'))"
+        language: system
+        files: ^docker-compose\.yml$

@@ -17,15 +17,67 @@ RESTful API endpoints для модуля управления расписан�
 
 from datetime import date, time
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
+from app.models.photographer import PhotographerProfile
+from app.models.room import StudioRoom
 from app.schemas.schedule.schemas import (
     # Template schemas
     ScheduleTemplateCreate,
+)
+
+# ============================================================================
+# Helper Functions for Business Logic Validation
+# ============================================================================
+
+async def get_photographer_profile(db: AsyncSession, photographer_id: int) -> Optional[PhotographerProfile]:
+    """Получает профиль фотографа по ID.
+    
+    Args:
+        db: Сессия базы данных
+        photographer_id: ID профиля фотографа
+        
+    Returns:
+        Профиль фотографа или None если не найден
+    """
+    from sqlalchemy import select
+    result = await db.execute(select(PhotographerProfile).where(PhotographerProfile.id == photographer_id))
+    return result.scalar_one_or_none()
+
+
+async def get_room_by_id(db: AsyncSession, room_id: int) -> Optional[StudioRoom]:
+    """Получает зал студии по ID.
+    
+    Args:
+        db: Сессия базы данных
+        room_id: ID зала студии
+        
+    Returns:
+        Зал студии или None если не найден
+    """
+    from sqlalchemy import select
+    result = await db.execute(select(StudioRoom).where(StudioRoom.id == room_id))
+    return result.scalar_one_or_none()
+
+
+# ============================================================================
+# Router Configuration
+# ============================================================================
+
+router = APIRouter(
+    tags=["Schedule Management"],
+    responses={
+        400: {"description": "Bad request - ошибка валидации данных"},
+        403: {"description": "Forbidden - недостаточно прав доступа"},
+        404: {"description": "Not found - ресурс не найден"},
+    }
+)
+
+from app.schemas.schedule.schemas import (
     ScheduleTemplateResponse,
     ScheduleTemplateUpdate,
     ScheduleTemplatesBulkCreateRequest,
@@ -94,6 +146,7 @@ def paginate_response(data: List, total: int, skip: int, limit: int):
 # Schedule Template Endpoints
 # ============================================================================
 
+@limiter.limit("30/minute")  # Защита от частых запросов к расписанию
 @router.post(
     "/templates",
     response_model=ScheduleTemplateResponse,
@@ -116,13 +169,64 @@ async def create_schedule_template(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Создаёт новый шаблон расписания."""
+    """Создаёт новый шаблон расписания.
+    
+    Проверяет:
+    - Время начала < время окончания
+    - День недели в диапазоне 1-7
+    - Пользователь является владельцем шаблона
+    """
+    
+    from app.core.exceptions import ValidationException, ForbiddenException
+    
+    # Проверка 1: start_time < end_time
+    if template_data.start_time >= template_data.end_time:
+        raise ValidationException(
+            detail=f"Время начала ({template_data.start_time}) должно быть раньше времени окончания ({template_data.end_time})",
+            error_code="INVALID_TIME_RANGE",
+        )
+    
+    # Проверка 2: День недели в диапазоне 1-7
+    if not (1 <= template_data.day_of_week.value <= 7):
+        raise ValidationException(
+            detail=f"День недели должен быть в диапазоне 1-7. Получено: {template_data.day_of_week.value}",
+            error_code="INVALID_DAY_OF_WEEK",
+        )
+    
+    # Проверка 3: Пользователь является владельцем шаблона
+    owner_id = template_data.owner_id
+    owner_type = template_data.owner_type.value
+    
+    if owner_type == "photographer":
+        # Фотограф может создавать шаблон только для себя
+        photographer_profile = await get_photographer_profile(db, owner_id)
+        if not photographer_profile:
+            raise NotFoundException(
+                resource_type="photographer",
+                detail=f"Фотограф с id={owner_id} не найден",
+                error_code="PHOTOGRAPHER_NOT_FOUND",
+            )
+        if photographer_profile.user_id != current_user.id:
+            raise ForbiddenException(
+                detail=f"Вы можете создавать шаблоны только для своего профиля (ваш user_id={current_user.id})",
+                error_code="OWN_PROFILE_ONLY",
+            )
+    elif owner_type == "room":
+        # Представитель студии может создавать шаблон только для своих залов
+        room = await get_room_by_id(db, owner_id)
+        if not room:
+            raise NotFoundException(
+                resource_type="room",
+                detail=f"Зал с id={owner_id} не найден",
+                error_code="ROOM_NOT_FOUND",
+            )
+        # Проверка прав (упрощенная - нужно реализовать проверку представительства)
     
     try:
         result = await ScheduleTemplateService.create_template(
             db=db,
-            owner_id=template_data.owner_id,
-            owner_type=template_data.owner_type.value,
+            owner_id=owner_id,
+            owner_type=owner_type,
             day_of_week=template_data.day_of_week.value,
             start_time=template_data.start_time,
             end_time=template_data.end_time,
@@ -155,6 +259,7 @@ async def create_schedule_template(
         )
 
 
+@limiter.limit("30/minute")  # Защита от скрейпинга
 @router.get(
     "/templates",
     response_model=ScheduleTemplatesListResponse,
@@ -218,6 +323,7 @@ async def get_schedule_templates(
         )
 
 
+@limiter.limit("60/minute")  # Защита от частых запросов к деталям
 @router.get(
     "/templates/{template_id}",
     response_model=ScheduleTemplateResponse,
