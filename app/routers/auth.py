@@ -5,14 +5,13 @@ from fastapi import APIRouter, Depends, Request, status
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-# Создаем локальный limiter для этого модуля
 limiter = Limiter(key_func=get_remote_address)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.crud import create_user, get_user_by_email, update_user, get_user_by_id
 from app.core.dependencies import get_current_user, get_db
-from app.core.exceptions import EmailAlreadyExistsError, InvalidCredentialsError
+from app.core.exceptions import EmailAlreadyExistsException, InvalidCredentialsException
 from app.core.security import (
     verify_password,
     create_access_token,
@@ -31,11 +30,11 @@ router = APIRouter(tags=["Authentication"])
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("3/minute")  # Защита от спама регистрации
-async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+async def register(request: Request, user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     """Регистрация нового пользователя с проверкой уникальности email и созданием профиля при необходимости."""
     existing_user = await get_user_by_email(db, user_data.email)
     if existing_user:
-        raise EmailAlreadyExistsError(email=user_data.email)
+        raise EmailAlreadyExistsException(email=user_data.email)
 
     new_user = await create_user(db=db, user_create=user_data)
 
@@ -56,7 +55,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenResponse)
-@limiter.limit("5/minute")  # Защита от brute-force атак
+@limiter.limit("1/minute")  # Защита от brute-force атак
 async def login(request: Request, db: AsyncSession = Depends(get_db)):
     """Аутентификация пользователя по email и паролю с выдачей JWT токенов.
     
@@ -72,7 +71,6 @@ async def login(request: Request, db: AsyncSession = Depends(get_db)):
     username = str(form_data.get("username", ""))
     password = str(form_data.get("password", ""))
     
-    # Логируем попытку входа (без пароля)
     logger.info(
         "Login attempt",
         endpoint="/api/v1/auth/login",
@@ -90,9 +88,8 @@ async def login(request: Request, db: AsyncSession = Depends(get_db)):
             client_ip=client_ip,
             username=username,
         )
-        raise InvalidCredentialsError()
+        raise InvalidCredentialsException()
     
-    # Успешный вход
     logger.info(
         "Login successful",
         endpoint="/api/v1/auth/login",
@@ -122,8 +119,8 @@ async def login(request: Request, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/refresh", response_model=TokenResponse)
-@limiter.limit("10/minute")  # Защита от злоупотреблений обновлением токенов
-async def refresh_token(token_data: TokenRefreshRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute")  
+async def refresh_token(request: Request, token_data: TokenRefreshRequest, db: AsyncSession = Depends(get_db)):
     """Обновление access токена с использованием валидного refresh токена."""
     from app.core.exceptions import InvalidTokenException, UserNotFoundException
     
@@ -191,7 +188,7 @@ async def update_current_user_profile(
     if user_update.email and user_update.email != current_user.email:
         existing_user = await get_user_by_email(db, user_update.email)
         if existing_user and existing_user.id != current_user.id:
-            raise EmailAlreadyExistsError(email=user_update.email)
+            raise EmailAlreadyExistsException(email=user_update.email)
 
     updated_user = await update_user(
         db=db,

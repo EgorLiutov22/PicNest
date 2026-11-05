@@ -38,6 +38,9 @@ COPY requirements.txt .
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# === ДОБАВЛЕНО: Обновление pip для корректного разрешения зависимостей ===
+RUN pip install --no-cache-dir --upgrade pip
+
 # Устанавливаем зависимости из requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -71,17 +74,23 @@ COPY --from=builder /opt/venv /opt/venv
 
 # Копируем код приложения
 COPY --chown=appuser:appgroup ./app ./app
-COPY --chown=appuser:appgroup ./main.py .
-COPY --chown=appuser:appgroup ./config.py .
+
+# Так как WORKDIR=/app, мы копируем main.py из корня хоста в /app/main.py
+# COPY --chown=appuser:appgroup ./main.py ./main.py
 
 # Устанавливаем права на файлы (только для чтения)
-RUN chmod -R 550 /app &&     chown -R appuser:appgroup /app
+RUN chmod -R 550 /app && \
+    chown -R appuser:appgroup /app
 
-# Переключаемся на non-root user
-USER appuser
+
 
 # Создаем директорию для логов и данных
 RUN mkdir -p /app/logs /app/data && chown appuser:appgroup /app/logs /app/data
+
+RUN chmod 750 /app/logs /app/data
+
+# Переключаемся на non-root user
+USER appuser
 
 # Открываем порт приложения
 EXPOSE 8000
@@ -91,7 +100,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Запускаем приложение через uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 
 # ============================================================================
 # Stage 3 (опционально): Debug - для отладки
@@ -111,4 +120,4 @@ RUN chmod -R 750 /app
 # Возвращаемся на appuser
 USER appuser
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

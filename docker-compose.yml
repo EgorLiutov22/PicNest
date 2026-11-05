@@ -1,18 +1,6 @@
-# ============================================================================
-# PicNest Marketplace API - Docker Compose Configuration
-# ============================================================================
-# Конфигурация сервисов для разработки и продакшена
-# Сервисы: app, db (PostgreSQL), redis (опционально)
-# Автор: PicNest Backend Team
-# Дата: 2026-10-21
-# ============================================================================
-
 version: '3.8'
 
 services:
-  # ==========================================================================
-  # FastAPI Application Service
-  # ==========================================================================
 
   app:
     build:
@@ -20,7 +8,6 @@ services:
       dockerfile: Dockerfile
       target: runtime
     image: picnest/picnest-api:${IMAGE_TAG:-latest}
-    container_name: picnest-api
     restart: unless-stopped
 
     ports:
@@ -58,19 +45,16 @@ services:
     networks:
       - picnest-network
 
-    deploy:
-      replicas: ${REPLICAS:-2}
-      resources:
-        limits:
-          cpus: '1'
-          memory: 512M
-        reservations:
-          cpus: '0.5'
-          memory: 256M
+    # deploy:
+    #   replicas: ${REPLICAS:-2}
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 512M
+    #     reservations:
+    #       cpus: '0.5'
+    #       memory: 256M
 
-  # ==========================================================================
-  # PostgreSQL Database Service
-  # ==========================================================================
 
   db:
     image: postgres:14-alpine
@@ -98,9 +82,6 @@ services:
     networks:
       - picnest-network
 
-  # ==========================================================================
-  # Redis Service (для кэширования и rate limiting)
-  # ==========================================================================
 
   redis:
     image: redis:7-alpine
@@ -124,9 +105,6 @@ services:
     networks:
       - picnest-network
 
-  # ==========================================================================
-  # PgAdmin (для управления базой данных) - опционально, только для development
-  # ==========================================================================
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -146,9 +124,7 @@ services:
     networks:
       - picnest-network
 
-  # ==========================================================================
-  # Prometheus (для метрик) - опционально, только для development/production monitoring
-  # ==========================================================================
+
 
   prometheus:
     image: prom/prometheus:latest
@@ -167,10 +143,6 @@ services:
 
     networks:
       - picnest-network
-
-  # ==========================================================================
-  # Grafana (для дашбордов) - опционально, только для development/production monitoring
-  # ==========================================================================
 
   grafana:
     image: grafana/grafana:latest
@@ -192,9 +164,6 @@ services:
     networks:
       - picnest-network
 
-# ==========================================================================
-# Volumes для persistent data
-# ==========================================================================
 
 volumes:
   postgres_data:
@@ -206,9 +175,6 @@ volumes:
   grafana_data:
     driver: local
 
-# ==========================================================================
-# Networks для изоляции сервисов
-# ==========================================================================
 
 networks:
   picnest-network:

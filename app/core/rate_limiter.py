@@ -5,9 +5,6 @@ Rate limiting для защиты API от злоупотреблений и а�
 Поддерживается два типа хранилищ:
 - In-memory (по умолчанию, для разработки)
 - Redis (для продакшена)
-
-Автор: PicNest Backend Team
-Дата: 2026-10-21
 """
 
 from __future__ import annotations
@@ -21,10 +18,6 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-
-# ============================================================================
-# Инициализация лимитера
-# ============================================================================
 
 def create_limiter() -> Limiter:
     """Создает и настраивает экземпляр Limiter.
@@ -53,18 +46,16 @@ def create_limiter() -> Limiter:
     if environment == "production" and redis_url:
         # Redis для продакшена
         try:
-            from slowapi.storage import RedisStorage
 
             limiter = Limiter(
                 key_func=get_remote_address,
-                storage=RedisStorage(redis_url),
-                default_limits=["100/hour"],  # Default rate limit
+                default_limits=["100/hour"],  
                 headers_enabled=True,
             )
 
             logger.info(
                 "Rate limiter initialized with Redis storage",
-                redis_url=redis_url[:20] + "...",  # Mask part of URL
+                redis_url=redis_url[:20] + "...",  
                 environment=environment,
             )
 
@@ -88,11 +79,9 @@ def _create_in_memory_limiter() -> Limiter:
         Limiter с in-memory storage
     """
 
-    from slowapi.storage import MemoryStorage
 
     limiter = Limiter(
         key_func=get_remote_address,
-        storage=MemoryStorage(),
         default_limits=["100/hour"],  # Default rate limit per IP
         headers_enabled=True,
     )
@@ -100,9 +89,6 @@ def _create_in_memory_limiter() -> Limiter:
     return limiter
 
 
-# ============================================================================
-# Rate limit decorators для различных endpoints
-# ============================================================================
 
 def get_rate_limit_decorator(limit: str) -> Callable:
     """Создает декоратор для rate limiting.
@@ -129,9 +115,7 @@ def get_rate_limit_decorator(limit: str) -> Callable:
     return decorator
 
 
-# ============================================================================
-# Rate limits для различных endpoints
-# ============================================================================
+
 
 RATE_LIMITS = {
     # Authentication endpoints (защита от brute-force)
@@ -155,9 +139,6 @@ RATE_LIMITS = {
 }
 
 
-# ============================================================================
-# Custom exception handler для RateLimitExceeded
-# ============================================================================
 
 async def rate_limit_exceeded_handler(request, exc):
     """Обработчик превышения лимита запросов.
@@ -203,9 +184,6 @@ async def rate_limit_exceeded_handler(request, exc):
     return response
 
 
-# ============================================================================
-# Utility functions
-# ============================================================================
 
 def get_current_rate_limit(endpoint_name: str) -> Optional[str]:
     """Получает текущий rate limit для endpoint.
@@ -240,25 +218,21 @@ def reset_rate_limit(key: str = "all"):
     """
 
     if key == "all":
-        from slowapi.storage import MemoryStorage
 
-        if isinstance(limiter.storage, MemoryStorage):
-            limiter.storage._storage.clear()
+        backend = getattr(limiter, 'backend', None) or getattr(limiter, 'storage', None)
+        if backend is not None:
+            if hasattr(backend, '_storage'):
+                backend._storage.clear()
+            elif hasattr(backend, 'clear'):
+                backend.clear()
     else:
         # Для Redis сброс по конкретному ключу
         pass
 
 
-# ============================================================================
-# Глобальный экземпляр Limiter
-# ============================================================================
 
 limiter = create_limiter()
 
-
-# ============================================================================
-# Экспорт функций и переменных
-# ============================================================================
 
 __all__ = [
     "limiter",

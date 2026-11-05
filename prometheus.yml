@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s        # Как часто собирать метрики
+  evaluation_interval: 15s    # Как часто проверять правила
+  scrape_timeout: 10s         # Таймаут на один сбор
+
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'picnest-api'
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['app:8000']
+        labels:
+          service: 'picnest-api'
+          environment: 'development'

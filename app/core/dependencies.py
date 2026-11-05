@@ -6,10 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.exceptions import (
-    InvalidTokenError,
-    TokenExpiredError,
-    UserInactiveError,
-    InvalidTokenPayloadError,
+    InvalidTokenException,
+    TokenExpiredException,
+    UserInactiveException,
+    InvalidTokenException as InvalidTokenPayloadException, 
 )
 from app.models.user import User
 from app.core.crud import get_user_by_id
@@ -32,22 +32,22 @@ async def get_current_user(
     from app.core.security import decode_token
     payload = decode_token(token)
     if payload is None:
-        raise InvalidTokenError()
+        raise InvalidTokenException()
 
     token_type = payload.get("type")
     if token_type != "access":
-        raise InvalidTokenPayloadError()
+        raise InvalidTokenPayloadException()
 
     user_id: Optional[str] = payload.get("user_id")
     if user_id is None:
-        raise InvalidTokenPayloadError()
+        raise InvalidTokenPayloadException()
 
     db_user = await get_user_by_id(db, user_id)
     if db_user is None:
         raise credentials_exception
 
     if not db_user.is_active:
-        raise UserInactiveError()
+        raise UserInactiveException()
 
     return db_user
 
@@ -56,7 +56,7 @@ async def get_current_active_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
     """Проверяет, что пользователь активен."""
-    from app.core.exceptions import UserInactiveError
+    from app.core.exceptions import UserInactiveException
     if not current_user.is_active:
-        raise UserInactiveError()
+        raise UserInactiveException()
     return current_user

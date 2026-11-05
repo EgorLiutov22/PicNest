@@ -1,6 +1,4 @@
 """
-RESTful API endpoints для модуля управления заказами PicNest Marketplace.
-
 Этот модуль содержит все API эндпоинты для работы с заказами:
 - POST /api/v1/orders - Создание нового заказа клиентом
 - GET /api/v1/orders - Получение списка заказов (с разграничением видимости)
@@ -14,36 +12,33 @@ RESTful API endpoints для модуля управления заказами 
 - Обработку ошибок со статус-кодами 400, 403, 404, 409
 - Атомарную проверку отсутствия пересечений временных интервалов
 
-Автор: PicNest Backend Team
-Дата: 2026-10-09
 """
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
+limiter = Limiter(key_func=get_remote_address)
 from app.core.db import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.models.orderstatus import OrderStatus as DBOrderStatus
 from app.models.ordertype import OrderType as DBOrderType
 from app.schemas.orders.schemas import (
-    # Schemas для создания
     OrderCreate,
     OrderCreateResponse,
     
-    # Schemas для ответов
     OrderResponse,
     OrdersListResponse,
     OrderSummary,
     
-    # Параметры запроса
     OrderSearchParams,
     OrderPaginationParams,
     
-    # Управление заказами
     OrderConfirmRequest,
     OrderCancelRequest,
     OrderCancelResponse,
@@ -61,9 +56,6 @@ from app.services.orders.services import (
 )
 
 
-# ============================================================================
-# Router Configuration
-# ============================================================================
 
 router = APIRouter(
     tags=["Orders Management"],
@@ -76,9 +68,6 @@ router = APIRouter(
 )
 
 
-# ============================================================================
-# Helper Functions for Response Formatting
-# ============================================================================
 
 def order_to_summary(order) -> OrderSummary:
     """Конвертирует модель заказа в Summary для списка."""
@@ -118,7 +107,6 @@ def order_to_detail_response(order) -> OrderResponse:
             "fixed_conditions": item.fixed_conditions or {},
         }
         
-        # Добавляем информацию о фотографе
         if item.photographer:
             photographer_info = PhotographerInfo(
                 id=item.photographer.id,
@@ -131,7 +119,6 @@ def order_to_detail_response(order) -> OrderResponse:
             )
             item_response["photographer_info"] = photographer_info
         
-        # Добавляем информацию о зале студии
         if item.studio_room:
             studio_info = StudioRoomInfo(
                 id=item.studio_room.id,
@@ -159,15 +146,13 @@ def order_to_detail_response(order) -> OrderResponse:
         created_at=order.created_at,
         client_id=order.client_id,
         items=items,
-        cancellation_conditions={},  # Можно добавить из модели если есть
+        cancellation_conditions={}, 
     )
 
 
-# ============================================================================
-# Order Creation Endpoint (POST /api/v1/orders)
-# ============================================================================
 
-@limiter.limit("20/minute")  # Защита от спама бронирований
+
+@limiter.limit("2/minute")  
 @router.post(
     "",
     response_model=OrderCreateResponse,
@@ -215,6 +200,7 @@ def order_to_detail_response(order) -> OrderResponse:
     """
 )
 async def create_order(
+    request: Request,
     order_data: OrderCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -230,7 +216,7 @@ async def create_order(
     
     from app.core.exceptions import ValidationException, ForbiddenException
     
-    # Проверка 1: Все временные интервалы должны быть в будущем
+
     now = datetime.now()
     min_start_time = now + timedelta(hours=1)  # Минимум за час до начала
     max_duration = timedelta(hours=8)
@@ -361,11 +347,9 @@ async def create_order(
         )
 
 
-# ============================================================================
-# Orders List Endpoint (GET /api/v1/orders)
-# ============================================================================
 
-@limiter.limit("60/minute")  # Защита от частых запросов к списку
+
+@limiter.limit("1/minute")  # Защита от частых запросов к списку
 @router.get(
     "",
     response_model=OrdersListResponse,
@@ -393,6 +377,7 @@ async def create_order(
     """
 )
 async def get_orders(
+    request: Request,
     status: Optional[str] = Query(None, description="Фильтр по статусу (pending_payment, confirmed, in_progress, completed, cancelled)"),
     order_type: Optional[str] = Query(None, description="Фильтр по типу заказа (photographer_only, studio_only, combined)"),
     start_date: Optional[date] = Query(None, description="Дата начала временного диапазона"),
@@ -442,11 +427,9 @@ async def get_orders(
         )
 
 
-# ============================================================================
-# Order Detail Endpoint (GET /api/v1/orders/{id})
-# ============================================================================
 
-@limiter.limit("100/minute")  # Защита от частых запросов к детальным данным
+
+@limiter.limit("1/minute")  # Защита от частых запросов к детальным данным
 @router.get(
     "/{order_id}",
     response_model=OrderResponse,
@@ -466,6 +449,7 @@ async def get_orders(
     """
 )
 async def get_order_detail(
+    request: Request,
     order_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -506,10 +490,6 @@ async def get_order_detail(
             error_code="ORDER_DETAIL_ERROR",
         )
 
-
-# ============================================================================
-# Order Confirm Endpoint (POST /api/v1/orders/{id}/confirm)
-# ============================================================================
 
 @router.post(
     "/{order_id}/confirm",
@@ -655,9 +635,6 @@ async def confirm_order(
         )
 
 
-# ============================================================================
-# Order Cancel Endpoint (POST /api/v1/orders/{id}/cancel)
-# ============================================================================
 
 @router.post(
     "/{order_id}/cancel",
@@ -817,9 +794,6 @@ async def cancel_order(
         )
 
 
-# ============================================================================
-# Additional Utility Endpoints (Опционально)
-# ============================================================================
 
 @router.get(
     "/{order_id}/availability-check",

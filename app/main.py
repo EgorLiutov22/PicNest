@@ -6,9 +6,6 @@
 - Настройку логирования (структурированное логирование через structlog)
 - Middleware для обработки ошибок и логирования запросов
 - Подключение всех роутеров API
-
-Автор: PicNest Backend Team
-Дата: 2026-10-20
 """
 
 from datetime import datetime, timezone
@@ -30,11 +27,23 @@ from fastapi.responses import JSONResponse, Response
 
 from app.routers.auth import router as auth_router
 from app.routers.orders import router as orders_router
+# from app.routers.schedule import router as schedule_router
 
-
-# ============================================================================
-# Настройка Sentry (интеграция для мониторинга ошибок)
-# ============================================================================
+app = FastAPI(
+    title="PicNest Marketplace API",
+    description=(
+        "RESTful API для маркетплейса фотостудий и фотографов с управлением расписанием и заказами.\n\n"
+        "**Основные возможности:**\n"
+        "- Бронирование фотографов и залов фотостудий\n"
+        "- Управление жизненным циклом заказов (создание, подтверждение, отмена)\n"
+        "- Структурированное логирование и мониторинг ошибок\n"
+        "- Интеграция с Sentry для отслеживания ошибок\n"
+        "- Rate limiting для защиты от злоупотреблений и атак\n"
+    ),
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
 def setup_sentry(settings) -> None:
     """Настраивает Sentry для отслеживания ошибок.
@@ -117,9 +126,7 @@ def before_send_transaction_filter(event, hint):
     return event
 
 
-# ============================================================================
-# Настройка Prometheus метрик
-# ============================================================================
+
 
 def setup_prometheus_metrics(app) -> Instrumentator:
     """Настраивает Prometheus instrumentation для FastAPI приложения.
@@ -182,9 +189,6 @@ def setup_prometheus_metrics(app) -> Instrumentator:
         raise
 
 
-# ============================================================================
-# Endpoint для экспорта метрик Prometheus (только для внутренних IP)
-# ============================================================================
 
 @app.get("/metrics")
 async def metrics_endpoint(request: Request):
@@ -209,7 +213,7 @@ async def metrics_endpoint(request: Request):
     
     # Проверяем что запрос из внутренней сети
     client_ip = request.client.host if request.client else "unknown"
-    allowed_ips = ["127.0.0.1", "localhost"]  # Расширить список при необходимости
+    allowed_ips = ["127.0.0.1", "localhost", "172.16.0.0/12", "192.168.0.0/16"]  # Расширить список при необходимости
     
     # Разрешаем только localhost и внутренние IP (пример)
     if not any(client_ip.startswith(prefix) for prefix in ["127.", "192.168.", "10."]):
@@ -234,29 +238,8 @@ async def metrics_endpoint(request: Request):
     )
 
 
-# ============================================================================
-# Инициализация FastAPI приложения
-# ============================================================================
 
-app = FastAPI(
-    title="PicNest Marketplace API",
-    description=(
-        "RESTful API для маркетплейса фотостудий и фотографов с управлением расписанием и заказами.\n\n"
-        "**Основные возможности:**\n"
-        "- Бронирование фотографов и залов фотостудий\n"
-        "- Управление жизненным циклом заказов (создание, подтверждение, отмена)\n"
-        "- Структурированное логирование и мониторинг ошибок\n"
-        "- Интеграция с Sentry для отслеживания ошибок\n"
-        "- Rate limiting для защиты от злоупотреблений и атак\n"
-    ),
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
 
-# ============================================================================
-# Регистрация CORS middleware для защиты от атак
-# ============================================================================
 
 from app.core.config import get_settings
 settings = get_settings()
@@ -269,9 +252,6 @@ app.add_middleware(
     allow_headers=settings.CORS_ALLOW_HEADERS.split(",") if settings.CORS_ALLOW_HEADERS else ["Authorization", "Content-Type", "X-Requested-With", "Accept"],
 )
 
-# ============================================================================
-# Регистрация middleware для защиты от XSS и других атак
-# ============================================================================
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next: Callable):
@@ -330,19 +310,12 @@ async def add_security_headers(request: Request, call_next: Callable):
     
     return response
 
-# ============================================================================
-# Регистрация SlowAPI middleware для rate limiting
-# ============================================================================
 
 from app.core.rate_limiter import limiter, rate_limit_exceeded_handler
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-
-# ============================================================================
-# Middleware: Генерация request_id и передача в контекст логирования
-# ============================================================================
 
 @app.middleware("http")
 async def generate_request_id(request: Request, call_next: Callable):
@@ -388,9 +361,7 @@ async def generate_request_id(request: Request, call_next: Callable):
     return response
 
 
-# ============================================================================
-# Middleware: Логирование всех запросов
-# ============================================================================
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next: Callable):
@@ -466,9 +437,6 @@ async def log_requests(request: Request, call_next: Callable):
         raise
 
 
-# ============================================================================
-# Health Check Endpoint
-# ============================================================================
 
 @app.get("/health")
 async def health_check():
@@ -512,7 +480,7 @@ async def health_check():
         engine = get_async_engine()
         
         if engine is not None:
-            database_status = "connected" if use_postgresql else "sqlite_connected"
+            database_status = "connected"
         else:
             database_status = "error"
             
@@ -535,9 +503,6 @@ async def health_check():
     return health_response
 
 
-# ============================================================================
-# Инициализация приложения при старте
-# ============================================================================
 
 @app.on_event("startup")
 async def startup():
@@ -589,12 +554,10 @@ async def startup():
         logger.error(f"Failed to initialize database: {e}")
 
 
-# ============================================================================
-# Подключение роутеров API
-# ============================================================================
 
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(orders_router, prefix="/api/v1/orders", tags=["Orders Management"])
+# app.include_router(schedule_router, prefix="/api/v1/schedule", tags=["Schedule Management"]) 
 # TODO: Подключить роутер расписания после создания модели ScheduleBlock в БД
 
 
