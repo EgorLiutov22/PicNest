@@ -162,28 +162,29 @@ async def rate_limit_exceeded_handler(request, exc):
 
     logger = get_logger()
 
-    # Получаем информацию о лимите
-    rate_limit = exc.detail.split(" ")[0] if " " in exc.detail else "unknown"
+    rate_limit = exc.detail.split(" ")[0] if exc.detail and " " in exc.detail else "unknown"
+
+    try:
+        retry_after = int(getattr(exc, "retry_after", 60))
+    except (TypeError, ValueError):
+        retry_after = 60
 
     logger.warning(
         f"Rate limit exceeded: {rate_limit}",
         path=request.url.path,
         method=request.method,
-        client_ip=exc.ip if hasattr(exc, 'ip') else None,
+        client_ip=getattr(exc, "ip", None),
     )
 
-    # Формируем ответ с заголовком Retry-After
     response = Response(
         status_code=429,
         content={
             "error_code": "RATE_LIMIT_EXCEEDED",
-            "detail": f"Слишком много запросов. Попробуйте снова через {exc.retry_after} секунд.",
-            "retry_after": exc.retry_after if hasattr(exc, 'retry_after') else 60,
+            "detail": f"Слишком много запросов. Попробуйте снова через {retry_after} секунд.",
+            "retry_after": retry_after,
         },
     )
-
-    # Добавляем заголовок Retry-After для HTTP клиентов
-    response.headers["Retry-After"] = str(exc.retry_after if hasattr(exc, 'retry_added') else 60)
+    response.headers["Retry-After"] = str(retry_after)
 
     return response
 

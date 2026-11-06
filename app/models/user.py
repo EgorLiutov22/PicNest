@@ -31,3 +31,6 @@ class User(Base):
 
     photographer_profile: Mapped[Optional["PhotographerProfile"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     studio_profile: Mapped[Optional["StudioProfile"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+    orders: Mapped[List["Order"]] = relationship(back_populates="client", cascade="all, delete-orphan")
+    reviews: Mapped[List["Review"]] = relationship(back_populates="author", cascade="all, delete-orphan")

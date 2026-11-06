@@ -562,6 +562,11 @@ async def startup():
 
 
 
+from app.core.error_handlers import register_exception_handlers  # noqa: E402
+
+register_exception_handlers(app)
+
+
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(orders_router, prefix="/api/v1/orders", tags=["Orders Management"])
 # app.include_router(schedule_router, prefix="/api/v1/schedule", tags=["Schedule Management"]) 

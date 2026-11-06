@@ -392,11 +392,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         >>> register_exception_handlers(app)
     """
 
-    # Кастомные исключения приложения (AppException и все подклассы)
-    app.add_exception_handler(
-        Exception,  # Используем Exception как базовый класс для всех кастомных исключений
-        app_exception_handler,
-    )
+    from app.core.exceptions import AppException
+
+    app.add_exception_handler(AppException, app_exception_handler)
 
     # Ошибки валидации FastAPI/Pydantic
     app.add_exception_handler(
@@ -424,9 +422,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     except ImportError:
         pass
 
-    # Глобальный обработчик для всех необработанных ошибок
     app.add_exception_handler(
-        Exception,  # Перехватываем все остальные исключения
+        Exception,
         general_exception_handler,
     )
 
