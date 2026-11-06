@@ -6,7 +6,7 @@ from typing import Optional
 
 from sqlalchemy import (
     String, Text, Integer, DECIMAL, Boolean, Date, TIME, 
-    DateTime, ForeignKey, Enum as SQLEnum, CheckConstraint, Index
+    DateTime, ForeignKey, Enum as SQLEnum, CheckConstraint, Index, func
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -21,6 +21,6 @@ class Payment(Base):
     platform_commission: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False)
     external_transaction_id: Mapped[Optional[str]] = mapped_column(String(255))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     order: Mapped["Order"] = relationship(back_populates="payments")

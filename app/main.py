@@ -211,12 +211,13 @@ async def metrics_endpoint(request: Request):
     from app.core.logging import get_logger
     logger = get_logger()
     
-    # Проверяем что запрос из внутренней сети
+    # Проверяем что запрос из внутренней сети.
+    # 172.x — адреса docker-сети (Prometheus scraper ходит именно оттуда),
+    # поэтому 172.16.0.0/12 должен быть в списке разрешённых.
     client_ip = request.client.host if request.client else "unknown"
-    allowed_ips = ["127.0.0.1", "localhost", "172.16.0.0/12", "192.168.0.0/16"]  # Расширить список при необходимости
-    
+
     # Разрешаем только localhost и внутренние IP (пример)
-    if not any(client_ip.startswith(prefix) for prefix in ["127.", "192.168.", "10."]):
+    if not any(client_ip.startswith(prefix) for prefix in ["127.", "192.168.", "10.", "172."]):
         logger.warning(
             "Запрещенный доступ к /metrics из внешнего IP",
             client_ip=client_ip,
@@ -475,15 +476,21 @@ async def health_check():
     # Проверяем статус БД
     database_status = "unknown"
     try:
-        from app.core.db import get_async_engine, use_postgresql
-        
+        from sqlalchemy import text
+
+        from app.core.db import get_async_engine
+
         engine = get_async_engine()
-        
-        if engine is not None:
-            database_status = "connected"
-        else:
+
+        if engine is None:
             database_status = "error"
-            
+        else:
+            # Реальный запрос, а не просто наличие объекта engine: engine
+            # создаётся при импорте модуля и существует даже при мёртвой БД.
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            database_status = "connected"
+
     except Exception as e:
         logger.error("Ошибка проверки статуса БД", error=str(e))
         database_status = "error"

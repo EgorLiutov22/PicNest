@@ -75,6 +75,11 @@ COPY --from=builder /opt/venv /opt/venv
 # Копируем код приложения
 COPY --chown=appuser:appgroup ./app ./app
 
+# Alembic: конфиг и каталог миграций нужны для `alembic upgrade head`
+# в отдельном one-shot контейнере (сервис migrate в docker-compose.prod.yml).
+COPY --chown=appuser:appgroup ./alembic.ini ./alembic.ini
+COPY --chown=appuser:appgroup ./alembic ./alembic
+
 # Так как WORKDIR=/app, мы копируем main.py из корня хоста в /app/main.py
 # COPY --chown=appuser:appgroup ./main.py ./main.py
 
@@ -100,7 +105,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Запускаем приложение через uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# --proxy-headers + --forwarded-allow-ips: приложение стоит за nginx на хосте,
+# без этого request.client.host всегда будет адресом docker-шлюза, и rate
+# limiting (slowapi key_func=get_remote_address) ограничит всех клиентов как
+# одного. "*" безопасен здесь, потому что порт опубликован только на
+# 127.0.0.1 — достучаться до контейнера извне, минуя nginx, нельзя.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]
 
 # ============================================================================
 # Stage 3 (опционально): Debug - для отладки

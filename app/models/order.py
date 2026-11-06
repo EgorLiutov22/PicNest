@@ -4,8 +4,8 @@ from decimal import Decimal
 from typing import List, Optional
 
 from sqlalchemy import (
- DECIMAL, 
-    DateTime, ForeignKey, Enum as SQLEnum
+ DECIMAL,
+    DateTime, ForeignKey, Enum as SQLEnum, func
 )
 from sqlalchemy.orm import  Mapped, mapped_column, relationship
 
@@ -22,7 +22,7 @@ class Order(Base):
     status: Mapped[OrderStatus] = mapped_column(SQLEnum(OrderStatus), default=OrderStatus.pending_payment, nullable=False)
     total_price: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
     prepayment_amount: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     client: Mapped["User"] = relationship(back_populates="orders")
     items: Mapped[List["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")

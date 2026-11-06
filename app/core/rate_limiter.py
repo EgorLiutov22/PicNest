@@ -47,15 +47,19 @@ def create_limiter() -> Limiter:
         # Redis для продакшена
         try:
 
+            # storage_uri обязателен: без него slowapi создаёт in-memory
+            # хранилище, и каждый uvicorn-worker считает лимиты отдельно —
+            # при --workers 2 клиент получает вдвое больше запросов.
             limiter = Limiter(
                 key_func=get_remote_address,
-                default_limits=["100/hour"],  
+                storage_uri=redis_url,
+                default_limits=["100/hour"],
                 headers_enabled=True,
             )
 
             logger.info(
                 "Rate limiter initialized with Redis storage",
-                redis_url=redis_url[:20] + "...",  
+                redis_url=redis_url[:20] + "...",
                 environment=environment,
             )
 

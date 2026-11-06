@@ -1,0 +1,297 @@
+# ============================================================================
+# PicNest — production docker-compose
+# ============================================================================
+# Отличия от dev-версии docker-compose.yml:
+#   * порты наружу публикует только app, и только на loopback (nginx на хосте
+#     ходит в 127.0.0.1:8000). db/redis/prometheus доступны исключительно
+#     внутри сети picnest-network через expose.
+#   * restart: always для всех сервисов.
+#   * именованные volumes для данных + отдельный volume для логов.
+#   * healthcheck у каждого сервиса; app ждёт healthy db и redis.
+#   * лимиты памяти: на VPS 4 GB без лимитов Grafana + Prometheus + Postgres
+#     конкурируют за память и могут выбить сборку/приложение по OOM.
+#   * migrate — one-shot сервис: alembic upgrade head перед стартом app.
+#
+# Запуск:  docker compose -f docker-compose.prod.yml up -d --build
+# ============================================================================
+
+name: picnest
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Миграции БД. Одноразовый контейнер: выполняет alembic upgrade head и
+  # завершается. app стартует только после успешного завершения (exit 0).
+  # --------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: picnest/picnest-api:${IMAGE_TAG:-latest}
+    command: ["alembic", "upgrade", "head"]
+    env_file:
+      - .env.production
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - picnest-network
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # FastAPI (uvicorn)
+  # --------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: picnest/picnest-api:${IMAGE_TAG:-latest}
+    container_name: picnest-app
+    restart: always
+
+    # Только loopback: nginx на хосте проксирует сюда. Снаружи порт 8000
+    # недоступен, что исключает обход nginx-лимитов и TLS напрямую.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    env_file:
+      - .env.production
+
+    environment:
+      - TZ=UTC
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+    volumes:
+      - app_logs:/app/logs
+      - app_data:/app/data
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+    logging: *default-logging
+    networks:
+      - picnest-network
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL 15
+  # --------------------------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: picnest-db
+    restart: always
+
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-picnest}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_DB=${POSTGRES_DB:-picnest}
+      # scram-sha-256 для TCP-подключений (app -> db). Локальный сокет
+      # оставлен на trust по умолчанию: healthcheck ходит внутри контейнера
+      # без пароля, а --auth-local=scram-sha-256 ломал его (psql требовал
+      # пароль и сервис навсегда оставался unhealthy).
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - TZ=UTC
+
+    # Наружу НЕ публикуем. Доступ только из picnest-network.
+    expose:
+      - "5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # pg_isready не требует аутентификации и отвечает, только когда сервер
+    # реально принимает соединения. psql здесь не годится: в зависимости от
+    # pg_hba.conf он может запросить пароль, которого у healthcheck нет.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-picnest} -d ${POSTGRES_DB:-picnest} -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # Небольшой VPS: не даём Postgres забрать всю память под shared_buffers
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=100
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+    logging: *default-logging
+    networks:
+      - picnest-network
+
+  # --------------------------------------------------------------------------
+  # Redis 7 (кеш, rate limiting, сессии)
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: picnest-redis
+    restart: always
+
+    # appendonly — персистентность AOF; maxmemory + LRU, чтобы Redis не съел
+    # всю память хоста.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+
+    expose:
+      - "6379"
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+
+    logging: *default-logging
+    networks:
+      - picnest-network
+
+  # --------------------------------------------------------------------------
+  # Prometheus — сбор метрик с app:8000/metrics
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: picnest-prometheus
+    restart: always
+
+    volumes:
+      - ./prometheus.prod.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+    expose:
+      - "9090"
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.external-url=/prometheus/
+
+    depends_on:
+      app:
+        condition: service_started
+
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+    logging: *default-logging
+    networks:
+      - picnest-network
+
+  # --------------------------------------------------------------------------
+  # Grafana — дашборды. Порт не публикуем: доступ через SSH-туннель
+  #   ssh -L 3000:127.0.0.1:3000 root@SERVER
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: picnest-grafana
+    restart: always
+
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - TZ=UTC
+
+    expose:
+      - "3000"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+    depends_on:
+      prometheus:
+        condition: service_started
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+    logging: *default-logging
+    networks:
+      - picnest-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  app_logs:
+    driver: local
+  app_data:
+    driver: local
+
+networks:
+  picnest-network:
+    driver: bridge
