@@ -431,6 +431,49 @@ def step_install_docker(r: Remote, cfg: DeployConfig) -> None:
     r.log.ok("Docker и Compose v2 установлены")
 
 
+def step_docker_mirror(r: Remote, cfg: DeployConfig) -> None:
+    """Проверить доступность Docker Hub и при необходимости включить зеркало.
+
+    Часть хостеров не маршрутизирует IPv4 до Cloudflare-адресов Docker Hub:
+    curl проходит (он выбирает IPv6), а dockerd, работая только по IPv4,
+    получает i/o timeout и образы не скачиваются.
+    """
+    r.log.step("2b/8", "Доступность Docker Hub")
+
+    rc, _, _ = r.run(
+        "timeout 15 curl -4 -fsS -o /dev/null https://auth.docker.io/token",
+        check=False,
+        quiet=True,
+    )
+    if rc == 0:
+        r.log.ok("Docker Hub доступен напрямую")
+        return
+
+    r.log.warn("Docker Hub недоступен по IPv4 — включаем зеркало mirror.gcr.io")
+
+    r.run(
+        "python3 - <<'PY'\n"
+        "import json, os\n"
+        "p = '/etc/docker/daemon.json'\n"
+        "cfg = {}\n"
+        "if os.path.exists(p):\n"
+        "    with open(p) as f:\n"
+        "        try:\n"
+        "            cfg = json.load(f)\n"
+        "        except ValueError:\n"
+        "            cfg = {}\n"
+        "mirrors = cfg.setdefault('registry-mirrors', [])\n"
+        "if 'https://mirror.gcr.io' not in mirrors:\n"
+        "    mirrors.insert(0, 'https://mirror.gcr.io')\n"
+        "with open(p, 'w') as f:\n"
+        "    json.dump(cfg, f, indent=2)\n"
+        "PY",
+        timeout=120,
+    )
+    r.run("systemctl restart docker", timeout=180)
+    r.log.ok("Зеркало включено, docker перезапущен")
+
+
 def step_swap(r: Remote, cfg: DeployConfig) -> None:
     r.log.step("3/8", f"Swap ({cfg.swap_mb} MB)")
 
@@ -842,6 +885,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         step_preflight(r, cfg)
         step_install_docker(r, cfg)
+        step_docker_mirror(r, cfg)
         if cfg.swap_mb > 0:
             step_swap(r, cfg)
         step_clone(r, cfg)
