@@ -363,7 +363,8 @@ class OrderResponse(BaseModel):
     prepayment_amount: Decimal = Field(..., description="Сумма предоплаты")
     created_at: datetime = Field(..., description="Время создания заказа")
     
-    client_id: int = Field(..., description="ID клиента (создателя заказа)")
+    # ID пользователя — UUID-строка (users.id), а не int
+    client_id: str = Field(..., description="ID клиента (создателя заказа)")
     
     items: List[OrderItemResponse] = Field(
         ..., 

@@ -5,6 +5,9 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 python-jose[cryptography]>=3.3.0,<3.5.0
 passlib[bcrypt]>=1.7.4
+# passlib 1.7.4 несовместим с bcrypt 5.x: загрузка бэкенда падает с
+# ValueError, и регистрация/вход отвечают 500.
+bcrypt<5
 python-multipart>=0.0.6
 uvicorn[standard]>=0.24.0
 email-validator>=2.0.0

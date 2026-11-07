@@ -14,17 +14,16 @@
 
 """
 
-from datetime import date, datetime, timedelta
+import json
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-
-limiter = Limiter(key_func=get_remote_address)
+from app.core.rate_limiter import limiter
 from app.core.db import get_db
 from app.core.dependencies import get_current_user
+from app.core.exceptions import AppException
 from app.models.user import User
 from app.models.orderstatus import OrderStatus as DBOrderStatus
 from app.models.ordertype import OrderType as DBOrderType
@@ -96,6 +95,14 @@ def order_to_detail_response(order) -> OrderResponse:
     
     items = []
     for item in order.items:
+        # В колонке Text снапшот хранится JSON-строкой
+        conditions = item.fixed_conditions
+        if isinstance(conditions, str):
+            try:
+                conditions = json.loads(conditions)
+            except ValueError:
+                conditions = {}
+
         item_response = {
             "id": item.id,
             "photographer_id": item.photographer_id,
@@ -104,7 +111,7 @@ def order_to_detail_response(order) -> OrderResponse:
             "start_time": item.start_time,
             "end_time": item.end_time,
             "fixed_price": item.fixed_price,
-            "fixed_conditions": item.fixed_conditions or {},
+            "fixed_conditions": conditions or {},
         }
         
         if item.photographer:
@@ -152,7 +159,6 @@ def order_to_detail_response(order) -> OrderResponse:
 
 
 
-@limiter.limit("2/minute")  
 @router.post(
     "",
     response_model=OrderCreateResponse,
@@ -199,6 +205,7 @@ def order_to_detail_response(order) -> OrderResponse:
     - 400 Bad Request - ошибки валидации данных
     """
 )
+@limiter.limit("2/minute")
 async def create_order(
     request: Request,
     order_data: OrderCreate,
@@ -217,16 +224,22 @@ async def create_order(
     from app.core.exceptions import ValidationException, ForbiddenException
     
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     min_start_time = now + timedelta(hours=1)  # Минимум за час до начала
     max_duration = timedelta(hours=8)
-    
+
     # Группируем элементы заказа по времени для проверки пересечений
     time_slots = []
-    
+
     for idx, item in enumerate(order_data.items):
-        start_dt = item.start_time if isinstance(item.start_time, datetime) else item.start_time.replace(tzinfo=None)
-        end_dt = item.end_time if isinstance(item.end_time, datetime) else item.end_time.replace(tzinfo=None)
+        start_dt = item.start_time
+        end_dt = item.end_time
+        # Схема требует время с часовым поясом; страхуемся от naive-значений,
+        # иначе сравнение с min_start_time падает с TypeError.
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
         
         # Проверка 1.1: Все временные интервалы в будущем
         if start_dt < min_start_time:
@@ -315,10 +328,13 @@ async def create_order(
         
     except SlotConflictError as e:
         from app.core.exceptions import SlotAlreadyBookedException
+        # start_time/end_time у SlotConflictError нет — getattr со значением
+        # по умолчанию, иначе обработчик падал с AttributeError и клиент
+        # получал 500 вместо 409.
         raise SlotAlreadyBookedException(
-            studio_id=getattr(e, 'studio_id', None),
-            start_time=e.start_time,
-            end_time=e.end_time,
+            studio_id=getattr(e, "studio_id", None),
+            start_time=getattr(e, "start_time", None),
+            end_time=getattr(e, "end_time", None),
             detail=f"Слот занят: {e.message}",
             error_code="SLOT_ALREADY_BOOKED",
         )
@@ -349,7 +365,6 @@ async def create_order(
 
 
 
-@limiter.limit("1/minute")  # Защита от частых запросов к списку
 @router.get(
     "",
     response_model=OrdersListResponse,
@@ -376,6 +391,7 @@ async def create_order(
     - GET /api/v1/orders?start_date=2026-10-01&end_date=2026-10-31
     """
 )
+@limiter.limit("30/minute")
 async def get_orders(
     request: Request,
     status: Optional[str] = Query(None, description="Фильтр по статусу (pending_payment, confirmed, in_progress, completed, cancelled)"),
@@ -412,14 +428,17 @@ async def get_orders(
             items=[order_to_summary(order) for order in orders],
             total=total_count,
             skip=skip,
-            limit=min(limit, total_count),
+            limit=total_count,
         )
-        
+
+    except AppException:
+        # Бизнес-исключения (403/404/409/400) не должны превращаться в 500
+        raise
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Error fetching orders for user {current_user.id}: {e}")
-        
+
         from app.core.exceptions import DatabaseException
         raise DatabaseException(
             detail="Внутренняя ошибка сервера при получении списка заказов",
@@ -429,7 +448,6 @@ async def get_orders(
 
 
 
-@limiter.limit("1/minute")  # Защита от частых запросов к детальным данным
 @router.get(
     "/{order_id}",
     response_model=OrderResponse,
@@ -448,6 +466,7 @@ async def get_orders(
     - Условия отмены заказа
     """
 )
+@limiter.limit("60/minute")
 async def get_order_detail(
     request: Request,
     order_id: int,
@@ -479,6 +498,8 @@ async def get_order_detail(
             detail=f"Доступ к заказу запрещен: {e.message}",
             error_code="ORDER_ACCESS_DENIED",
         )
+    except AppException:
+        raise
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
@@ -542,18 +563,38 @@ async def confirm_order(
             current_user=current_user,
         )
         
-        # Проверка 1: Исполнитель может подтвердить только свой заказ
+        # Проверка 1: Исполнитель может подтвердить только свой заказ.
+        # OrderItem хранит id профиля (int), а current_user.id — UUID,
+        # поэтому ищем профили этого пользователя отдельно.
+        from app.models.photographerprofile import PhotographerProfile
+        from app.models.studioprofile import StudioProfile
+        from sqlalchemy import select as _select
+
+        photographer_ids = set(
+            (await db.execute(
+                _select(PhotographerProfile.id).where(
+                    PhotographerProfile.user_id == current_user.id
+                )
+            )).scalars().all()
+        )
+        studio_ids = set(
+            (await db.execute(
+                _select(StudioProfile.id).where(
+                    StudioProfile.user_id == current_user.id
+                )
+            )).scalars().all()
+        )
+
         is_performer = False
         performer_type = None
-        
+
         for item in order.items:
-            if item.photographer_id == current_user.id:
+            if item.photographer_id in photographer_ids:
                 is_performer = True
                 performer_type = "photographer"
                 break
-            
-            # Проверка для представителя студии
-            if item.studio_room and hasattr(item.studio_room, 'studio') and item.studio_room.studio_id == current_user.id:
+
+            if item.studio_room and item.studio_room.studio_id in studio_ids:
                 is_performer = True
                 performer_type = "studio_representative"
                 break
@@ -572,17 +613,20 @@ async def confirm_order(
             )
         
         # Проверка 3: Время начала в будущем
-        now = datetime.now()
-        start_time_dt = order.items[0].start_time if hasattr(order.items, '__getitem__') else None
-        
-        if start_time_dt and isinstance(start_time_dt, (datetime, str)):
+        now = datetime.now(timezone.utc)
+        start_time_dt = order.items[0].start_time if order.items else None
+
+        if start_time_dt is not None:
             if isinstance(start_time_dt, str):
                 try:
                     start_time_dt = datetime.fromisoformat(start_time_dt.replace('Z', '+00:00'))
                 except ValueError:
-                    pass
-            
-            if isinstance(start_time_dt, datetime) and start_time_dt < now:
+                    start_time_dt = None
+
+        if isinstance(start_time_dt, datetime):
+            if start_time_dt.tzinfo is None:
+                start_time_dt = start_time_dt.replace(tzinfo=timezone.utc)
+            if start_time_dt < now:
                 raise ValidationException(
                     detail=f"Нельзя подтвердить заказ с временем начала в прошлом. Время начала: {start_time_dt}",
                     error_code="CANNOT_CONFIRM_PAST_ORDER",
@@ -706,38 +750,51 @@ async def cancel_order(
                 error_code="CANNOT_CANCEL_COMPLETED_ORDER",
             )
         
-        # Проверка 3: Отмена возможна только до определенного времени после начала работы
+        # Проверка 3: заказ в работе отменить нельзя
         if order.status == DBOrderStatus.in_progress:
-            # Для заказов в процессе работы — отмена с нулевым возвратом
             raise ValidationException(
                 detail="Заказ находится в процессе работы. Возврат средств не возможен.",
                 error_code="NO_REFUND_IN_PROGRESS",
             )
-        
-        # Проверка 4: Отмена за менее чем 24 часа до начала — штраф
-        now = datetime.now()
-        start_time_dt = order.items[0].start_time if hasattr(order.items, '__getitem__') else None
-        
-        if start_time_dt and isinstance(start_time_dt, (datetime, str)):
-            if isinstance(start_time_dt, str):
-                start_time_dt = datetime.fromisoformat(start_time_dt.replace('Z', '+00:00'))
-            
+
+        # Проверка 4: правила отмены.
+        # Неоплаченный заказ отменяется всегда; оплаченный — не позднее
+        # чем за 24 часа до начала, либо в течение 15 минут после создания,
+        # если бронь оформлена меньше чем за сутки до съёмки.
+        start_time_dt = order.items[0].start_time if order.items else None
+        if start_time_dt is not None and order.status != DBOrderStatus.pending_payment:
+            now = datetime.now(timezone.utc)
+            if start_time_dt.tzinfo is None:
+                start_time_dt = start_time_dt.replace(tzinfo=timezone.utc)
+            created_at = order.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
             time_until_start = start_time_dt - now
-            
-            if time_until_start.total_seconds() < 24 * 3600:  # Менее 24 часов
+            time_since_created = now - created_at
+
+            refund_allowed = (
+                time_until_start.total_seconds() >= 24 * 3600
+                or time_since_created.total_seconds() <= 15 * 60
+            )
+            if not refund_allowed:
                 raise ValidationException(
-                    detail=f"Отмена возможна только за 24 часа до начала. До начала осталось {time_until_start}.",
+                    detail=(
+                        "Отмена с возвратом возможна не позднее чем за 24 часа до начала "
+                        f"съёмки. До начала осталось {time_until_start}."
+                    ),
                     error_code="CANCELLATION_TOO_LATE",
                 )
-        
+
         # Рассчитываем возврат средств
         refund_amount, refund_percentage = await StatusManagerService.calculate_refund(
             prepayment_amount=order.prepayment_amount,
             total_price=order.total_price,
             status_at_cancellation=order.status,
-            cancellation_date=datetime.now(),
-            created_at=order.created_at,
-            conditions={},  # Можно добавить из модели заказа если есть
+            cancellation_date=datetime.now(timezone.utc),
+            created_at=order.created_at if order.created_at.tzinfo else order.created_at.replace(tzinfo=timezone.utc),
+            conditions={},
+            start_time=start_time_dt,
         )
         
         # Обновляем статус на cancelled через сервис

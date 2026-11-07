@@ -47,14 +47,20 @@ def create_limiter() -> Limiter:
         # Redis для продакшена
         try:
 
-            # storage_uri обязателен: без него slowapi создаёт in-memory
-            # хранилище, и каждый uvicorn-worker считает лимиты отдельно —
-            # при --workers 2 клиент получает вдвое больше запросов.
             limiter = Limiter(
                 key_func=get_remote_address,
                 storage_uri=redis_url,
-                default_limits=["100/hour"],
-                headers_enabled=True,
+                # default_limits намеренно не задаём: middleware применял бы
+                # лимит ко всем маршрутам, включая /health и /metrics.
+                # Docker healthcheck дёргает /health раз в 30 с, Prometheus —
+                # /metrics раз в 15 с, и оба упирались в лимит.
+                #
+                # headers_enabled=False: с ним slowapi пытается добавить
+                # X-RateLimit-* в объект ответа, а эндпоинты возвращают
+                # Pydantic-модели и параметра response у них нет — падало
+                # с "parameter `response` must be an instance of Response".
+                # Retry-After в ответе 429 проставляет обработчик ниже.
+                headers_enabled=False,
             )
 
             logger.info(
@@ -86,8 +92,7 @@ def _create_in_memory_limiter() -> Limiter:
 
     limiter = Limiter(
         key_func=get_remote_address,
-        default_limits=["100/hour"],  # Default rate limit per IP
-        headers_enabled=True,
+        headers_enabled=False,
     )
 
     return limiter
@@ -157,7 +162,7 @@ async def rate_limit_exceeded_handler(request, exc):
         JSONResponse с информацией об ошибке и Retry-After
     """
 
-    from fastapi import Response
+    from fastapi.responses import JSONResponse
     from app.core.logging import get_logger
 
     logger = get_logger()
@@ -176,7 +181,9 @@ async def rate_limit_exceeded_handler(request, exc):
         client_ip=getattr(exc, "ip", None),
     )
 
-    response = Response(
+    # JSONResponse, а не Response: Response.content ожидает bytes или str,
+    # на словаре падает с AttributeError и отдаёт 500 вместо 429.
+    response = JSONResponse(
         status_code=429,
         content={
             "error_code": "RATE_LIMIT_EXCEEDED",

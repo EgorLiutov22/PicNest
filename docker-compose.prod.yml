@@ -68,6 +68,10 @@ services:
 
     environment:
       - TZ=UTC
+      # Каталог для сбора метрик от нескольких воркеров. Без него каждый
+      # процесс хранит счётчики в своей памяти, и /metrics отдаёт данные
+      # случайного воркера.
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
 
     depends_on:
       db:

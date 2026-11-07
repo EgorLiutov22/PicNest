@@ -11,41 +11,74 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
+
 import structlog
 from structlog.processors import JSONRenderer, TimeStamper, add_log_level
 from structlog.contextvars import merge_contextvars
 
 
-logging.basicConfig(
-    format="%(message)s",
-    level=logging.INFO,
-)
+def get_environment() -> str:
+    """Текущее окружение (production/development) из переменных окружения."""
+    return os.environ.get("ENVIRONMENT", "development")
 
 
-structlog.configure(
-    processors=[
-        merge_contextvars,
-        add_log_level,
-        TimeStamper(fmt="iso"),
-        JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),  # ← Из structlog, а НЕ stdlib!
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
+def resolve_log_level(level: str | None = None) -> int:
+    """Приводит имя уровня логирования к константе logging.
+
+    Порядок: явный аргумент, затем LOG_LEVEL из окружения, затем INFO.
+    """
+    name = (level or os.environ.get("LOG_LEVEL") or "INFO").upper()
+    return getattr(logging, name, logging.INFO)
+
+
+def setup_app_logging(
+    log_level: str | None = None,
+    output_format: str | None = None,
+) -> None:
+    """Настраивает structlog с учётом LOG_LEVEL и LOG_FORMAT.
+
+    Args:
+        log_level: Уровень (DEBUG/INFO/WARNING/ERROR). По умолчанию LOG_LEVEL.
+        output_format: "json" или "console". По умолчанию LOG_FORMAT или json.
+    """
+    level = resolve_log_level(log_level)
+    fmt = (output_format or os.environ.get("LOG_FORMAT") or "json").lower()
+
+    logging.basicConfig(
+        format="%(message)s",
+        level=level,
+        stream=sys.stdout,
+        force=True,
+    )
+
+    renderer = (
+        structlog.dev.ConsoleRenderer() if fmt == "console" else JSONRenderer()
+    )
+
+    structlog.configure(
+        processors=[
+            merge_contextvars,
+            add_log_level,
+            TimeStamper(fmt="iso"),
+            renderer,
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
+# Начальная конфигурация при импорте: уровень берётся из LOG_LEVEL,
+# формат — из LOG_FORMAT. main.py переконфигурирует это на startup.
+setup_app_logging()
+
 
 def get_logger(name: str = __name__):
     """Получить настроенный logger."""
     return structlog.get_logger(name)
-
-def setup_app_logging(*args, **kwargs):
-    """Инициализация логирования приложения.
-    
-    В нашем случае логирование уже настроено при импорте модуля,
-    поэтому эта функция-заглушка для совместимости с main.py.
-    """
-    pass
 
 class LogContext:
     """Контекст логирования для добавления информации о запросах.

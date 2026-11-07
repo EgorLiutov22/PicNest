@@ -1,17 +1,19 @@
 from datetime import timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request, status
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-limiter = Limiter(key_func=get_remote_address)
+from app.core.rate_limiter import limiter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.crud import create_user, get_user_by_email, update_user, get_user_by_id
 from app.core.dependencies import get_current_user, get_db
-from app.core.exceptions import EmailAlreadyExistsException, InvalidCredentialsException
+from app.core.exceptions import (
+    EmailAlreadyExistsException,
+    InvalidCredentialsException,
+    UserInactiveException,
+)
 from app.core.security import (
     verify_password,
     create_access_token,
@@ -55,22 +57,34 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
 
 
 @router.post("/login", response_model=TokenResponse)
-@limiter.limit("1/minute")  # Защита от brute-force атак
+@limiter.limit("5/minute")  # Защита от brute-force атак
 async def login(request: Request, db: AsyncSession = Depends(get_db)):
     """Аутентификация пользователя по email и паролю с выдачей JWT токенов.
-    
+
+    Принимает и form-urlencoded (как Swagger и OAuth2PasswordBearer), и JSON.
     Логгирует успешные и неудачные попытки входа для мониторинга безопасности.
     """
     from app.core.logging import get_logger
-    
+
     logger = get_logger()
     request_id = getattr(request.state, "request_id", "unknown")
     client_ip = request.client.host if request.client else "unknown"
-    
-    form_data = await request.form()
-    username = str(form_data.get("username", ""))
-    password = str(form_data.get("password", ""))
-    
+
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        # На JSON-тело request.form() возвращает пустую форму, и клиент
+        # получал 401 «неверный пароль» вместо ошибки формата запроса.
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        username = str(body.get("username") or body.get("email") or "")
+        password = str(body.get("password") or "")
+    else:
+        form_data = await request.form()
+        username = str(form_data.get("username", ""))
+        password = str(form_data.get("password", ""))
+
     logger.info(
         "Login attempt",
         endpoint="/api/v1/auth/login",
@@ -89,6 +103,17 @@ async def login(request: Request, db: AsyncSession = Depends(get_db)):
             username=username,
         )
         raise InvalidCredentialsException()
+
+    if not user.is_active or user.status == "blocked":
+        logger.warning(
+            "Login rejected - inactive or blocked user",
+            endpoint="/api/v1/auth/login",
+            request_id=request_id,
+            client_ip=client_ip,
+            user_id=user.id,
+            status=user.status,
+        )
+        raise UserInactiveException()
     
     logger.info(
         "Login successful",

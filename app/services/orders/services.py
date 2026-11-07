@@ -19,8 +19,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
+import json
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, text, update
@@ -43,6 +44,8 @@ from app.models.schedule import (
 
 if TYPE_CHECKING:
     from app.schemas.orders.schemas import OrderCreate, OrderStatusEnum
+
+from app.schemas.orders.schemas import OrderTypeEnum
 
 
 # ============================================================================
@@ -222,22 +225,22 @@ class AvailabilityCheckerService:
         overlap_condition = and_(
             OrderItem.start_time < end_time,
             OrderItem.end_time > start_time,
+            # Отменённые заказы не занимают слот
+            Order.status != OrderStatus.cancelled,
         )
-        
+
         if photographer_id:
-            query = select(OrderItem.id).where(
+            query = select(OrderItem.id).join(Order, OrderItem.order_id == Order.id).where(
                 and_(
                     overlap_condition,
                     OrderItem.photographer_id == photographer_id,
-                    OrderItem.studio_room_id.is_(None),  # Только фотограф (не combined)
                 ),
             )
         elif studio_room_id:
-            query = select(OrderItem.id).where(
+            query = select(OrderItem.id).join(Order, OrderItem.order_id == Order.id).where(
                 and_(
                     overlap_condition,
                     OrderItem.studio_room_id == studio_room_id,
-                    OrderItem.photographer_id.is_(None),  # Только зал (не combined)
                 ),
             )
         else:
@@ -274,10 +277,13 @@ class AvailabilityCheckerService:
             True если есть блокировки, False в противном случае
         """
         
-        # Проверяем пересечения с блоками расписания
+        # Проверяем пересечения с блоками расписания.
+        # Условие must быть симметричным: частичное пересечение граничных дней
+        # (бронь 9 дек 22:00 - 10 дек 02:00 при блоке 10-12 дек) тоже должно
+        # считаться конфликтом.
         overlap_condition = and_(
-            ScheduleBlock.start_datetime <= start_time.date(),
-            ScheduleBlock.end_datetime >= end_time.date(),
+            ScheduleBlock.start_datetime <= end_time.date(),
+            ScheduleBlock.end_datetime >= start_time.date(),
         )
         
         if photographer_id:
@@ -374,30 +380,27 @@ class StatusManagerService:
     Проверяет права доступа перед изменением статуса.
     """
     
-    # Правила переходов между статусами
-    STATUS_RULES: Dict[OrderStatus, Dict[str, Any]] = {
+    # Правила переходов между статусами.
+    # Права актора заданы для каждого перехода отдельно: раньше на статус был
+    # один список allowed_by, и из-за этого клиент не мог отменить
+    # неоплаченный заказ (pending_payment разрешал переход только исполнителю).
+    STATUS_RULES: Dict[OrderStatus, Dict[OrderStatus, List[str]]] = {
         OrderStatus.pending_payment: {
-            "allowed_transitions": [OrderStatus.confirmed],
-            "allowed_by": ["performer"],  # Исполнитель подтверждает
+            OrderStatus.confirmed: ["performer"],
+            OrderStatus.cancelled: ["client", "system"],
         },
         OrderStatus.confirmed: {
-            "allowed_transitions": [OrderStatus.in_progress, OrderStatus.cancelled],
-            "allowed_by": ["system", "client"],  # Система (оплата) или клиент (отмена)
+            OrderStatus.in_progress: ["system"],
+            OrderStatus.cancelled: ["client", "system"],
         },
         OrderStatus.in_progress: {
-            "allowed_transitions": [OrderStatus.completed, OrderStatus.cancelled],
-            "allowed_by": ["system", "client"],  # Система (завершение) или клиент (отмена)
+            OrderStatus.completed: ["system"],
+            OrderStatus.cancelled: ["client", "system"],
         },
-        OrderStatus.completed: {
-            "allowed_transitions": [],  # Завершенный заказ не меняется
-            "allowed_by": [],
-        },
-        OrderStatus.cancelled: {
-            "allowed_transitions": [],  # Отмененный заказ не меняется
-            "allowed_by": [],
-        },
+        OrderStatus.completed: {},
+        OrderStatus.cancelled: {},
     }
-    
+
     @classmethod
     async def validate_transition(
         cls,
@@ -406,37 +409,36 @@ class StatusManagerService:
         actor_type: str,  # "client", "performer", или "system"
     ) -> bool:
         """Проверяет возможность перехода между статусами.
-        
+
         Args:
             current_status: Текущий статус заказа
             target_status: Целевой статус
             actor_type: Тип пользователя (client, performer, system)
-            
+
         Returns:
             True если переход разрешен
-            
+
         Raises:
             StatusTransitionNotAllowed: Если переход запрещен
         """
-        
+
         rules = cls.STATUS_RULES.get(current_status)
-        if not rules:
+        if rules is None:
             raise StatusTransitionNotAllowed(
                 f"Нет правил для статуса {current_status.value}"
             )
-        
-        # Проверяем целевой статус
-        if target_status not in rules["allowed_transitions"]:
-            allowed_values = [s.value for s in rules["allowed_transitions"]]
+
+        allowed_actors = rules.get(target_status)
+        if allowed_actors is None:
+            allowed_values = [s.value for s in rules.keys()]
             raise StatusTransitionNotAllowed(
                 f"Переход из {current_status.value} в {target_status.value} запрещен. "
-                f"Разрешенные: {', '.join(allowed_values)}"
+                f"Разрешенные: {', '.join(allowed_values) or 'нет'}"
             )
-        
-        # Проверяем права актора
-        if actor_type not in rules["allowed_by"]:
+
+        if actor_type not in allowed_actors:
             raise StatusTransitionNotAllowed(
-                f"Только {', '.join(rules['allowed_by'])} могут инициировать переход "
+                f"Только {', '.join(allowed_actors)} могут инициировать переход "
                 f"из {current_status.value}"
             )
         
@@ -499,51 +501,71 @@ class StatusManagerService:
         cancellation_date: datetime,
         created_at: datetime,
         conditions: Dict[str, Any],
+        start_time: Optional[datetime] = None,
     ) -> Tuple[Decimal, float]:
         """Рассчитывает сумму возврата при отмене заказа.
-        
-        Логика расчета:
-        - pending_payment: 100% возврат (заказ еще не подтвержден)
-        - confirmed: зависит от условий отмены (обычно 50-80%)
-        - in_progress: зависит от условий, может быть 0% если работа началась
-        
+
+        Правила возврата:
+        - Заказ не оплачен (pending_payment): возврат 100% в любой момент,
+          отменять можно всегда.
+        - До начала съёмки 24 часа и более: возврат 100%.
+        - Бронь оформлена менее чем за 24 часа до начала: полный возврат
+          доступен в течение 15 минут с момента создания заказа.
+        - Иначе возврат не производится.
+
         Args:
             prepayment_amount: Сумма предоплаты
             total_price: Общая стоимость заказа
             status_at_cancellation: Статус на момент отмены
             cancellation_date: Дата отмены
-            created_at: Дата создания
+            created_at: Дата создания заказа
             conditions: Условия отмены из заказа
-            
+            start_time: Время начала бронирования
+
         Returns:
             Кортеж (refund_amount, refund_percentage)
         """
-        
-        # По умолчанию 100% возврат для pending_payment
+
+        # Неоплаченный заказ отменяется всегда с полным возвратом
         if status_at_cancellation == OrderStatus.pending_payment:
             return prepayment_amount, 100.0
-        
-        # Проверяем условия отмены
-        conditions = conditions or {}
-        refund_policy = conditions.get("refund_policy", {})
-        
-        # По умолчанию 50% возврата для confirmed статуса
-        base_percentage = Decimal(str(refund_policy.get("percentage", 50)))
-        
-        # Учитываем время до начала заказа
-        time_before_start = (cancellation_date - created_at).total_seconds() / 3600
-        
-        if time_before_start > 48:  # Более 2 дней до создания
-            percentage_multiplier = Decimal("1.0")
-        elif time_before_start > 24:  # Более суток
-            percentage_multiplier = Decimal("0.9")
-        else:  # Менее суток
-            percentage_multiplier = Decimal("0.8")
-        
-        final_percentage = min(base_percentage * percentage_multiplier, Decimal(100))
-        refund_amount = prepayment_amount * (final_percentage / Decimal(100))
-        
-        return round(refund_amount, 2), float(final_percentage)
+
+        if start_time is None:
+            return Decimal("0.00"), 0.0
+
+        # Время до начала съёмки, а не время жизни заказа
+        time_before_start = (start_time - cancellation_date).total_seconds()
+
+        if time_before_start >= 24 * 3600:
+            return prepayment_amount, 100.0
+
+        # Поздняя бронь: 15 минут с момента создания заказа на отмену
+        time_since_created = (cancellation_date - created_at).total_seconds()
+        if time_before_start < 24 * 3600 and time_since_created <= 15 * 60:
+            return prepayment_amount, 100.0
+
+        return Decimal("0.00"), 0.0
+
+
+# ============================================================================
+# Вспомогательные функции
+# ============================================================================
+
+async def _profiles_of_user(db: AsyncSession, user_id: str, kind: str) -> List[Any]:
+    """Возвращает профили исполнителя (photographer или studio), привязанные к пользователю.
+
+    OrderItem хранит id профиля (int), а не UUID пользователя, поэтому для
+    проверки прав нужен этот переход.
+    """
+    if kind == "photographer":
+        result = await db.execute(
+            select(PhotographerProfile).where(PhotographerProfile.user_id == user_id)
+        )
+    else:
+        result = await db.execute(
+            select(StudioProfile).where(StudioProfile.user_id == user_id)
+        )
+    return list(result.scalars().all())
 
 
 # ============================================================================
@@ -600,34 +622,42 @@ class OrderService:
             )
         
         # 2. Получение данных для снапшота (цены, адреса, условия)
+        # Ключ — индекс элемента: Pydantic-модели нехешируемы и не годятся
+        # как ключи словаря.
         snapshot_data = await OrderService._collect_snapshot(
             db=db,
             items_data=order_data.items,
         )
-        
+
         # 3. Расчет общей стоимости из снапшота
         total_price = Decimal("0.00")
-        for item in order_data.items:
-            fixed_price = snapshot_data[item].fixed_price
-            total_price += fixed_price
-        
+        for idx in range(len(order_data.items)):
+            total_price += snapshot_data[idx]["fixed_price"]
+
+        # Предоплату задаёт клиент, но она не может превышать сумму заказа.
+        prepayment = order_data.prepayment_amount
+        if prepayment > total_price:
+            raise OrderValidationError(
+                f"Предоплата ({prepayment}) не может превышать сумму заказа ({total_price})"
+            )
+
         # 4. Создание заказа
         new_order = Order(
             client_id=client_id,
-            order_type=order_data.order_type.value,
+            order_type=order_data.order_type,
             status=OrderStatus.pending_payment,
             total_price=total_price,
-            prepayment_amount=order_data.prepayment_amount,
-            created_at=datetime.now(),
+            prepayment_amount=prepayment,
+            created_at=datetime.now(timezone.utc),
         )
-        
+
         db.add(new_order)
         await db.flush()  # Получаем ID заказа
-        
+
         # 5. Создание элементов заказа с фиксированными данными
-        for item_data in order_data.items:
-            snapshot = snapshot_data[item_data]
-            
+        for idx, item_data in enumerate(order_data.items):
+            snapshot = snapshot_data[idx]
+
             new_item = OrderItem(
                 order_id=new_order.id,
                 photographer_id=item_data.photographer_id,
@@ -635,10 +665,11 @@ class OrderService:
                 studio_room_id=item_data.studio_room_id,
                 start_time=item_data.start_time,
                 end_time=item_data.end_time,
-                fixed_price=snapshot.fixed_price,
-                fixed_conditions=snapshot.conditions,  # Снапшот условий
+                fixed_price=snapshot["fixed_price"],
+                # Колонка Text: словарь сериализуем в JSON-строку
+                fixed_conditions=json.dumps(snapshot["conditions"], ensure_ascii=False),
             )
-            
+
             db.add(new_item)
         
         # Фиксируем заказ в БД
@@ -651,28 +682,28 @@ class OrderService:
     async def _collect_snapshot(
         db: AsyncSession,
         items_data: List["OrderItemCreate"],
-    ) -> Dict["OrderItemCreate", Dict[str, Any]]:
+    ) -> Dict[int, Dict[str, Any]]:
         """Собирает снапшот данных на момент бронирования.
-        
+
         Снапшот включает:
-        - Цену за час/фиксированную цену
+        - Цену (для зала — умноженную на количество часов)
         - Адрес студии (для залов)
         - Условия отмены
-        
+
         Args:
             db: Асинхронная сессия БД
             items_data: Данные элементов заказа
-            
+
         Returns:
-            Словарь {item_data: snapshot_data}
+            Словарь {индекс элемента: snapshot_data}
         """
-        
-        snapshot = {}
-        
-        for item in items_data:
+
+        snapshot: Dict[int, Dict[str, Any]] = {}
+
+        for idx, item in enumerate(items_data):
             # Получаем данные из БД
             if item.photographer_id:
-                # Фотограф
+                # Фотограф: цена берётся из выбранной услуги
                 result = await db.execute(
                     select(PhotographerProfile, PhotographerService).where(
                         PhotographerProfile.id == item.photographer_id,
@@ -685,15 +716,15 @@ class OrderService:
                     )
                 )
                 row = result.first()
-                
+
                 if not row:
                     raise OrderValidationError(
                         f"Фотограф с ID {item.photographer_id} не найден"
                     )
-                
+
                 profile, photographer_service = row
-                
-                snapshot[item] = {
+
+                snapshot[idx] = {
                     "fixed_price": photographer_service.price if photographer_service else Decimal("0.00"),
                     "conditions": {
                         "photographer_name": profile.display_name,
@@ -701,9 +732,9 @@ class OrderService:
                         "terms_cancellation": "По соглашению сторон",
                     },
                 }
-            
+
             elif item.studio_room_id:
-                # Зал студии
+                # Зал студии: price_per_hour умножается на длительность аренды
                 result = await db.execute(
                     select(StudioRoom, StudioProfile).where(
                         StudioRoom.id == item.studio_room_id,
@@ -713,24 +744,31 @@ class OrderService:
                     )
                 )
                 row = result.first()
-                
+
                 if not row:
                     raise OrderValidationError(
                         f"Зал с ID {item.studio_room_id} не найден"
                     )
-                
+
                 room, studio = row
-                
-                snapshot[item] = {
-                    "fixed_price": room.price_per_hour,
+
+                hours = Decimal(
+                    (item.end_time - item.start_time).total_seconds() / 3600
+                ).quantize(Decimal("0.01"))
+                price = (room.price_per_hour * hours).quantize(Decimal("0.01"))
+
+                snapshot[idx] = {
+                    "fixed_price": price,
                     "conditions": {
                         "room_name": room.name,
                         "studio_title": studio.title,
                         "address": studio.address,
+                        "price_per_hour": str(room.price_per_hour),
+                        "hours": str(hours),
                         "terms_cancellation": "По соглашению сторон",
                     },
                 }
-        
+
         return snapshot
     
     @staticmethod
@@ -756,9 +794,9 @@ class OrderService:
             Кортеж (список заказов, общее количество)
         """
         
-        # Определяем роль пользователя
-        is_client = current_user.role_id == 1 if current_user.role_id else False  # Клиент
-        
+        # Определяем роль пользователя (в модели поле role, а не role_id)
+        is_client = current_user.role == "client"
+
         # Строим базовый запрос
         query = select(Order).options(
             joinedload(Order.client),
@@ -773,44 +811,30 @@ class OrderService:
             query = query.where(Order.client_id == current_user.id)
             total_query = total_query.where(Order.client_id == current_user.id)
         else:
-            # Исполнитель видит свои входящие брони
-            query = query.where(
-                or_(
-                    Order.items.any(
-                        and_(
-                            OrderItem.photographer_id == current_user.id,
-                            OrderItem.order_id == Order.id,
-                        )
-                    ),
-                    Order.items.any(
-                        and_(
-                            OrderItem.studio_room.has(
-                                StudioRoom.studio_id == current_user.id,  # Пример логики
-                            ),
-                            OrderItem.order_id == Order.id,
-                        )
-                    ),
-                )
+            # Исполнитель видит свои входящие брони.
+            # OrderItem.photographer_id — это photographer_profiles.id (int),
+            # а current_user.id — UUID пользователя. Сравнивать их напрямую
+            # бессмысленно, поэтому подзапросом берём id профилей пользователя.
+            photographer_profile_ids = select(PhotographerProfile.id).where(
+                PhotographerProfile.user_id == current_user.id
             )
-            
-            total_query = total_query.where(
-                or_(
-                    Order.items.any(
-                        and_(
-                            OrderItem.photographer_id == current_user.id,
-                            OrderItem.order_id == Order.id,
-                        )
-                    ),
-                    Order.items.any(
-                        and_(
-                            OrderItem.studio_room.has(
-                                StudioRoom.studio_id == current_user.id,
-                            ),
-                            OrderItem.order_id == Order.id,
-                        )
-                    ),
-                )
+            studio_profile_ids = select(StudioProfile.id).where(
+            StudioProfile.user_id == current_user.id
             )
+
+            performer_condition = or_(
+                Order.items.any(
+                    OrderItem.photographer_id.in_(photographer_profile_ids)
+                ),
+                Order.items.any(
+                    OrderItem.studio_room.has(
+                        StudioRoom.studio_id.in_(studio_profile_ids)
+                    )
+                ),
+            )
+
+            query = query.where(performer_condition)
+            total_query = total_query.where(performer_condition)
         
         # Применяем фильтры
         if search_params:
@@ -830,7 +854,9 @@ class OrderService:
         
         # Выполняем запросы
         result = await db.execute(query)
-        orders = result.scalars().all()
+        # unique() обязателен при joinedload коллекции: без него SQLAlchemy
+        # бросает InvalidRequestError и список заказов отдаёт 500.
+        orders = result.unique().scalars().all()
         
         total_result = await db.execute(total_query)
         total_count = total_result.scalar()
@@ -862,18 +888,18 @@ class OrderService:
             select(Order).where(Order.id == order_id).options(
                 joinedload(Order.client),
                 joinedload(Order.items).joinedload(OrderItem.photographer),
-                joinedload(Order.items).joinedload(OrderItem.studio_room),
+                joinedload(Order.items).joinedload(OrderItem.studio_room).joinedload(StudioRoom.studio),
                 joinedload(Order.items).joinedload(OrderItem.photographer_service),
             )
         )
         
-        order = result.scalar_one_or_none()
-        
+        order = result.unique().scalar_one_or_none()
+
         if not order:
             raise OrderNotFoundError(order_id)
-        
+
         # Проверка прав доступа
-        is_client = current_user.role_id == 1 if current_user.role_id else False
+        is_client = current_user.role == "client"
         
         if is_client and order.client_id != current_user.id:
             raise OrderForbiddenError(
@@ -881,20 +907,30 @@ class OrderService:
                 order_id=order_id,
             )
         
-        # Проверка для исполнителей (можно расширить логику)
+        # Проверка для исполнителей: сравниваем id профиля, а не UUID пользователя
         if not is_client:
+            performer_photographer_ids = {
+                p.id for p in await _profiles_of_user(db, current_user.id, "photographer")
+            }
+            performer_studio_ids = {
+                s.id for s in await _profiles_of_user(db, current_user.id, "studio")
+            }
+
             has_access = False
             for item in order.items:
-                if item.photographer_id == current_user.id:
+                if item.photographer_id in performer_photographer_ids:
                     has_access = True
                     break
-            
+                if item.studio_room and item.studio_room.studio_id in performer_studio_ids:
+                    has_access = True
+                    break
+
             if not has_access:
                 raise OrderForbiddenError(
                     f"Доступ к заказу {order_id} запрещен",
                     order_id=order_id,
                 )
-        
+
         return order
     
     @staticmethod
@@ -916,22 +952,35 @@ class OrderService:
             Заблокированный заказ
         """
         
+        # Блокируем только строку заказа. with_for_update() вместе с
+        # joinedload коллекции компилируется в LEFT OUTER JOIN ... FOR UPDATE,
+        # а PostgreSQL такое отклоняет ("FOR UPDATE cannot be applied to the
+        # nullable side of an outer join"). Поэтому связ�� читаем вторым запросом.
+        result = await db.execute(
+            select(Order).where(Order.id == order_id).with_for_update()
+        )
+
+        order = result.scalar_one_or_none()
+
+        if not order:
+            raise OrderNotFoundError(order_id)
+
         result = await db.execute(
             select(Order)
             .where(Order.id == order_id)
             .options(
                 joinedload(Order.client),
                 joinedload(Order.items).joinedload(OrderItem.photographer),
-                joinedload(Order.items).joinedload(OrderItem.studio_room),
+                joinedload(Order.items).joinedload(OrderItem.studio_room).joinedload(StudioRoom.studio),
+                joinedload(Order.items).joinedload(OrderItem.photographer_service),
             )
-            .with_for_update()  # Блокировка строки
+            .execution_options(populate_existing=True)
         )
-        
-        order = result.scalar_one_or_none()
-        
-        if not order:
-            raise OrderNotFoundError(order_id)
-        
+
+        loaded = result.unique().scalar_one_or_none()
+        if loaded is not None:
+            order = loaded
+
         return order
 
 

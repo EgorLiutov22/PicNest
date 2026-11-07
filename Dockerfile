@@ -90,7 +90,7 @@ RUN chmod -R 550 /app && \
 
 
 # Создаем директорию для логов и данных
-RUN mkdir -p /app/logs /app/data && chown appuser:appgroup /app/logs /app/data
+RUN mkdir -p /app/logs /app/data /tmp/prometheus && chown appuser:appgroup /app/logs /app/data /tmp/prometheus
 
 RUN chmod 750 /app/logs /app/data
 

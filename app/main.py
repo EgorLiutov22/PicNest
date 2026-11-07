@@ -128,65 +128,32 @@ def before_send_transaction_filter(event, hint):
 
 
 
-def setup_prometheus_metrics(app) -> Instrumentator:
+def setup_prometheus_metrics(app):
     """Настраивает Prometheus instrumentation для FastAPI приложения.
-    
+
     Args:
         app: FastAPI приложение
-        
+
     Returns:
-        Настроенный Instrumentator
-        
-    Examples:
-        >>> instrumentator = setup_prometheus_metrics(app)
+        Настроенный Instrumentator или None, если метрики отключены
     """
-    
-    from app.core.logging import get_logger, get_environment
+    from app.core.logging import get_logger
+    from app.core.metrics import setup_metrics
+
     logger = get_logger()
-    environment = get_environment()
-    
-    # Проверяем что Prometheus включен через переменную окружения
-    prometheus_enabled = os.environ.get("PROMETHEUS_ENABLED", "true").lower() == "true"
-    
-    if not prometheus_enabled:
-        logger.debug("Prometheus metrics disabled (PROMETHEUS_ENABLED=false)")
-        return Instrumentator()
-    
+
     try:
-        # Настройка Instrumentator
-        instrumentator = Instrumentator(
-            should_gather_latency=True,
-            should_include_latency_histogram=True,
-            should_group_status_codes=True,
-            should_ignore_verbosity=False,
-            should_respect_env_var=True,
-            env_var_name="PROMETHEUS_ENABLED",
-            metric_namespace="picnest",
-            metric_subsystem="api",
-        )
-        
-        # Исключаем чувствительные endpoint'ы
-        instrumentator.excluded_handlers([
-            "/docs",      # Swagger UI
-            "/redoc",     # ReDoc
-            "/openapi.json",  # OpenAPI spec
-            "/health",    # Health check (не нужно мониторить)
-            "/metrics",   # Сам эндпоинт метрик (чтобы избежать рекурсии)
-        ])
-        
-        instrumentator.instrument(app).add()
-        
-        logger.info(
-            "Prometheus metrics instrumentation configured",
-            environment=environment,
-            prometheus_enabled=prometheus_enabled,
-        )
-        
-        return instrumentator
-        
+        instrumentator = setup_metrics(app)
     except Exception as e:
-        logger.error(f"Failed to setup Prometheus metrics: {e}")
+        logger.error("Failed to setup Prometheus metrics", error=str(e))
         raise
+
+    if instrumentator is None:
+        logger.info("Prometheus metrics disabled", prometheus_enabled=False)
+    else:
+        logger.info("Prometheus metrics instrumentation configured")
+
+    return instrumentator
 
 
 
@@ -229,11 +196,13 @@ async def metrics_endpoint(request: Request):
     
     # Логируем запрос (опционально)
     logger.info("Request to /metrics endpoint", client_ip=client_ip)
-    
-    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-    
+
+    from prometheus_client import CONTENT_TYPE_LATEST
+
+    from app.core.metrics import render_metrics
+
     return Response(
-        content=generate_latest(),
+        content=render_metrics(),
         status_code=200,
         media_type=CONTENT_TYPE_LATEST,
     )
@@ -245,12 +214,25 @@ async def metrics_endpoint(request: Request):
 from app.core.config import get_settings
 settings = get_settings()
 
+def _split_csv(value: str | None, default: list[str]) -> list[str]:
+    """Разбирает список через запятую, отбрасывая пробелы и пустые элементы."""
+    if not value:
+        return default
+    items = [item.strip() for item in value.split(",")]
+    items = [item for item in items if item]
+    return items or default
+
+
+_cors_origins = _split_csv(settings.CORS_ALLOWED_ORIGINS, ["*"])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ALLOWED_ORIGINS.split(",") if settings.CORS_ALLOWED_ORIGINS else ["*"],
-    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
-    allow_methods=settings.CORS_ALLOW_METHODS.split(",") if settings.CORS_ALLOW_METHODS else ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=settings.CORS_ALLOW_HEADERS.split(",") if settings.CORS_ALLOW_HEADERS else ["Authorization", "Content-Type", "X-Requested-With", "Accept"],
+    allow_origins=_cors_origins,
+    # Wildcard вместе с credentials заставляет Starlette отражать любой Origin,
+    # то есть открывает CORS полностью. В этом случае credentials выключаем.
+    allow_credentials=settings.CORS_ALLOW_CREDENTIALS and "*" not in _cors_origins,
+    allow_methods=_split_csv(settings.CORS_ALLOW_METHODS, ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
+    allow_headers=_split_csv(settings.CORS_ALLOW_HEADERS, ["Authorization", "Content-Type", "X-Requested-With", "Accept"]),
 )
 
 
@@ -286,12 +268,14 @@ async def add_security_headers(request: Request, call_next: Callable):
     if not settings.DEBUG:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
     
-    # Content-Security-Policy: restricts allowed content sources
+    # Content-Security-Policy: restricts allowed content sources.
+    # Swagger UI и ReDoc подгружают JS/CSS с cdn.jsdelivr.net — без этого
+    # домена в script-src и style-src страница /docs в проде остаётся пустой.
     if not settings.DEBUG:
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "img-src 'self' data: https:; "
             "font-src 'self' data:; "
             "connect-src 'self'; "
@@ -502,12 +486,15 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "database_status": database_status,
     }
-    
-    # Логируем статус (если что-то не так)
+
+    # 503 при недоступной БД: docker healthcheck (curl -f) и deploy.py
+    # считают healthy любой 2xx, и приложение без базы выглядело бы живым.
+    status_code = 200 if database_status != "error" else 503
+
     if health_response["status"] != "healthy":
         logger.warning("Приложение работает в режиме degraded", **health_response)
-    
-    return health_response
+
+    return JSONResponse(status_code=status_code, content=health_response)
 
 
 
@@ -529,23 +516,25 @@ async def startup():
     from app.core.config import get_settings
     settings = get_settings()
     
-    # Настройка структурированного логирования
-    # Определяем окружение и формат логов
+    # Настройка структурированного логирования.
+    # Уровень и формат берём из настроек (LOG_LEVEL, LOG_FORMAT): раньше здесь
+    # были зашиты WARNING для прода и DEBUG для разработки, из-за чего
+    # LOG_LEVEL из .env не применялся.
     environment = settings.ENVIRONMENT or "development"
-    
+
     if environment == "production":
-        setup_app_logging(log_level="WARNING", output_format="json")
+        setup_app_logging(log_level=settings.LOG_LEVEL, output_format="json")
         logger.info(
             "Application started in PRODUCTION mode",
             log_format="JSON",
-            log_level="WARNING",
+            log_level=settings.LOG_LEVEL,
         )
     else:
-        setup_app_logging(log_level="DEBUG", output_format="console")
+        setup_app_logging(log_level=settings.LOG_LEVEL, output_format="console")
         logger.debug(
             "Application started in DEVELOPMENT mode",
             log_format="Console (colored)",
-            log_level="DEBUG",
+            log_level=settings.LOG_LEVEL,
         )
     
     # Инициализация Sentry для отслеживания ошибок
@@ -565,6 +554,7 @@ async def startup():
 from app.core.error_handlers import register_exception_handlers  # noqa: E402
 
 register_exception_handlers(app)
+setup_prometheus_metrics(app)
 
 
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])

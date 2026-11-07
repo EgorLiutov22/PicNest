@@ -661,7 +661,23 @@ def step_nginx(r: Remote, cfg: DeployConfig) -> None:
 
     r.run("mkdir -p /etc/nginx/snippets", timeout=60)
     r.upload(proxy_src, "/etc/nginx/snippets/picnest-proxy.conf", mode=0o644)
-    r.upload(site_src, "/etc/nginx/sites-available/picnest", mode=0o644)
+
+    # Конфиг сайта не перезаписываем, если его уже правил certbot: иначе
+    # повторный деплой сотрёт listen 443 и пути к сертификатам.
+    site_path = "/etc/nginx/sites-available/picnest"
+    certbot_managed = False
+    if r.exists(site_path):
+        rc, _, _ = r.run(
+            f"grep -q 'managed by Certbot' {shlex.quote(site_path)}",
+            check=False,
+            quiet=True,
+        )
+        certbot_managed = rc == 0
+
+    if certbot_managed:
+        r.log.ok("Конфиг nginx управляется certbot — не трогаем")
+    else:
+        r.upload(site_src, site_path, mode=0o644)
 
     r.run(
         "ln -sfn /etc/nginx/sites-available/picnest /etc/nginx/sites-enabled/picnest",

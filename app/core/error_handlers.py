@@ -217,8 +217,9 @@ async def pydantic_validation_exception_handler(
     # Преобразуем ошибки Pydantic в формат FastAPI
     errors = []
     for error in exc.errors():
+        # error["loc"] — кортеж пути до поля, например ("body", "email").
         errors.append({
-            "field": ".".join(str(loc.get("loc", ["unknown"]))),
+            "field": ".".join(str(part) for part in error.get("loc", ())),
             "message": error["msg"],
             "type": error["type"],
         })
