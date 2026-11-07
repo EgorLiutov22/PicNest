@@ -261,6 +261,8 @@ class DeployConfig:
     source: str = "git"  # "git" — клон с GitHub, "local" — залить рабочую копию
     has_docker: bool = False
     min_disk_gb: int = 6  # ниже этого порога сборка образа может упасть
+    frontend_dir: Optional[Path] = None  # локальный путь к проекту фронтенда
+    frontend_web_root: str = "/var/www/picnest-front"
 
 
 def generate_secret(length: int = 48) -> str:
@@ -654,10 +656,14 @@ def step_nginx(r: Remote, cfg: DeployConfig) -> None:
         r.log.ok("nginx установлен")
 
     local_root = Path(__file__).resolve().parent
-    site_src = local_root / "deploy" / "nginx.conf"
+    # Если разворачиваем фронтенд, берём конфиг, который раздаёт статику
+    # и проксирует /api/ — тогда фронт и API живут на одном origin.
+    site_src = local_root / "deploy" / (
+        "nginx-front.conf" if cfg.frontend_dir else "nginx.conf"
+    )
     proxy_src = local_root / "deploy" / "nginx-proxy.conf"
     if not site_src.exists() or not proxy_src.exists():
-        raise RemoteError("Не найдены deploy/nginx.conf или deploy/nginx-proxy.conf")
+        raise RemoteError(f"Не найден конфиг nginx: {site_src.name}")
 
     r.run("mkdir -p /etc/nginx/snippets", timeout=60)
     r.upload(proxy_src, "/etc/nginx/snippets/picnest-proxy.conf", mode=0o644)
@@ -696,6 +702,49 @@ def step_nginx(r: Remote, cfg: DeployConfig) -> None:
     r.run("systemctl enable --now nginx", timeout=120)
     r.run("systemctl reload nginx", timeout=120)
     r.log.ok("nginx запущен и перезагружен")
+
+
+def step_frontend(r: Remote, cfg: DeployConfig) -> None:
+    """Собрать SPA локально и выложить статику на сервер."""
+    if cfg.frontend_dir is None:
+        r.log.step("6b/8", "Фронтенд — не задан (--frontend-dir)")
+        return
+
+    r.log.step("6b/8", "Сборка и выкладка фронтенда")
+
+    local_dir = cfg.frontend_dir
+    dist = local_dir / "dist"
+    if not dist.exists():
+        raise RemoteError(
+            f"Нет {dist}. Соберите фронтенд: cd {local_dir} && npm ci && npm run build"
+        )
+    r.log.ok(f"Сборка найдена: {dist}")
+
+    # Загружаем во временный каталог и подменяем атомарно, чтобы не отдавать
+    # пользователям наполовину обновлённую статику.
+    staging = "/var/www/picnest-front-new"
+    r.run(f"rm -rf {staging} && mkdir -p {staging}", timeout=120)
+
+    uploaded = 0
+    for path in dist.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(dist).as_posix()
+        remote_path = posixpath.join(staging, rel)
+        r.run(f"mkdir -p {shlex.quote(posixpath.dirname(remote_path))}", quiet=True)
+        if not r.dry_run:
+            assert r._sftp is not None
+            r._sftp.put(str(path), remote_path)
+        uploaded += 1
+    r.log.ok(f"Загружено файлов: {uploaded}")
+
+    r.run(
+        f"rm -rf {shlex.quote(cfg.frontend_web_root)} && "
+        f"mv {staging} {shlex.quote(cfg.frontend_web_root)}",
+        timeout=120,
+    )
+    r.run(f"chmod -R a+rX {shlex.quote(cfg.frontend_web_root)}", timeout=120)
+    r.log.ok(f"Статика в {cfg.frontend_web_root}")
 
 
 def step_deploy(r: Remote, cfg: DeployConfig) -> None:
@@ -828,6 +877,11 @@ def build_parser() -> argparse.ArgumentParser:
         "(--skip-build) можно снизить до 2",
     )
     p.add_argument("--skip-nginx", action="store_true", help="не трогать nginx")
+    p.add_argument(
+        "--frontend-dir",
+        help="путь к локальному проекту фронтенда; если задан, загружаются "
+        "собранные файлы из dist/ и nginx начинает раздавать статику",
+    )
     p.add_argument("--skip-build", action="store_true", help="не пересобирать образ, только перезапуск")
     p.add_argument("--dry-run", action="store_true", help="показать команды, ничего не выполняя")
     return p
@@ -878,6 +932,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         swap_mb=args.swap_mb,
         source=args.source,
         min_disk_gb=args.min_disk_gb,
+        frontend_dir=(
+            Path(args.frontend_dir).expanduser().resolve() if args.frontend_dir else None
+        ),
     )
 
     log = Log(dry_run=cfg.dry_run)
@@ -907,6 +964,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         step_clone(r, cfg)
         step_configs(r, cfg)
         step_nginx(r, cfg)
+        step_frontend(r, cfg)
         step_deploy(r, cfg)
         step_health(r, cfg)
 
