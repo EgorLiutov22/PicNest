@@ -1,19 +1,17 @@
 """
-Pydantic v2 схемы для модуля управления расписанием PicNest.
+Pydantic-схемы модуля расписания PicNest.
 
-Этот модуль содержит все схемы валидации данных для API endpoints, связанных с управлением
-рабочим графиком фотографов и залов фотостудий. Включает схемы для:
-- Weekly schedule templates (недельные шаблоны)
-- Schedule exceptions (исключения из расписания)
-- Schedule blocks (блокировки временных слотов)
-
-Все схемы используют Pydantic v2 с strict validation и типизацией.
+Имена полей совпадают с тем, что уже ждут роутер и БД:
+- блокировки хранят интервал во времени (start_at/end_at), а не дату:
+  заблокировать «с 14 до 16» иначе невыразимо;
+- списки отдают настроенные списки ключей, а не голые массивы.
 """
 
-from datetime import date, time
+from datetime import date as DateType, datetime, time
 from enum import Enum
-from typing import List, Optional, Union
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class DayOfWeek(int, Enum):
@@ -33,349 +31,186 @@ class ScheduleOwnerType(str, Enum):
     ROOM = "room"
 
 
-# ============================================================================
-# Base schemas
-# ============================================================================
-
 class ScheduleBaseModel(BaseModel):
-    """Базовая схема с общими настройками валидации."""
+    """Базовая схема с общими настройками.
+
+    strict=True здесь не годится: ISO-строки дат и времени из JSON
+    перестают приниматься, и клиент получает 422 на обычном запросе.
+    """
     model_config = ConfigDict(
-        strict=True,
         populate_by_name=True,
         from_attributes=True,
-        use_enum_values=True,
     )
 
 
 # ============================================================================
-# Schedule Template schemas (недельные шаблоны)
+# Templates: недельный шаблон рабочего времени
 # ============================================================================
 
 class ScheduleTemplateBase(ScheduleBaseModel):
-    """Базовая схема для шаблона расписания с общей валидацией времени."""
-    
     day_of_week: DayOfWeek = Field(
-        ..., 
-        description="День недели (1-7, где 1 - понедельник)",
-        ge=1,
-        le=7
+        ..., description="День недели (1-7, где 1 — понедельник)"
     )
-    start_time: time = Field(
-        ..., 
-        description="Время начала работы",
-        examples=["09:00:00"]
-    )
-    end_time: time = Field(
-        ..., 
-        description="Время окончания работы",
-        examples=["18:00:00"]
-    )
+    start_time: time = Field(..., description="Время начала работы", examples=["09:00:00"])
+    end_time: time = Field(..., description="Время окончания работы", examples=["18:00:00"])
 
-    @field_validator('end_time')
-    @classmethod
-    def validate_end_time_after_start(cls, v: time, info) -> time:
-        """Проверяет, что время окончания строго больше времени начала."""
-        if info.data.get('start_time') and v <= info.data['start_time']:
-            raise ValueError('Время окончания должно быть строго после времени начала')
-        return v
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "ScheduleTemplateBase":
+        if self.end_time <= self.start_time:
+            raise ValueError("Время окончания должно быть строго после времени начала")
+        return self
 
 
 class ScheduleTemplateCreate(ScheduleTemplateBase):
-    """Схема для создания нового шаблона расписания."""
-    
-    owner_id: int = Field(
-        ..., 
-        description="ID владельца (photographer_profile.id или room.id)",
-        gt=0
-    )
-    owner_type: ScheduleOwnerType = Field(
-        ..., 
-        description="Тип владельца",
-        examples=["photographer", "room"]
-    )
-
-    @field_validator('owner_id')
-    @classmethod
-    def validate_owner_id(cls, v: int, info) -> int:
-        """Проверяет корректность owner_id в зависимости от owner_type."""
-        if info.data.get('owner_type') == 'photographer' and v <= 0:
-            raise ValueError('ID фотографа должен быть положительным числом')
-        elif info.data.get('owner_type') == 'room' and v <= 0:
-            raise ValueError('ID зала должен быть положительным числом')
-        return v
+    owner_id: int = Field(..., gt=0, description="ID владельца (профиль или зал)")
+    owner_type: ScheduleOwnerType = Field(..., description="Тип владельца")
 
 
 class ScheduleTemplateUpdate(ScheduleBaseModel):
-    """Схема для обновления существующего шаблона расписания."""
-    
-    day_of_week: Optional[DayOfWeek] = Field(
-        None, 
-        description="День недели (1-7)",
-        ge=1,
-        le=7
-    )
+    day_of_week: Optional[DayOfWeek] = Field(None, description="День недели (1-7)")
     start_time: Optional[time] = Field(None, description="Время начала работы")
     end_time: Optional[time] = Field(None, description="Время окончания работы")
 
-    @field_validator('end_time')
-    @classmethod
-    def validate_end_time_after_start_update(cls, v: Optional[time], info) -> Optional[time]:
-        """Проверяет, что время окончания строго больше времени начала при обновлении."""
-        if v is not None and info.data.get('start_time') and v <= info.data['start_time']:
-            raise ValueError('Время окончания должно быть строго после времени начала')
-        return v
-
 
 class ScheduleTemplateResponse(ScheduleBaseModel):
-    """Схема ответа с данными шаблона расписания."""
-    
-    id: int = Field(..., description="Уникальный ID шаблона")
-    owner_id: int = Field(..., description="ID владельца")
-    owner_type: str = Field(..., description="Тип владельца (photographer или room)")
-    day_of_week: int = Field(..., description="День недели (1-7)")
-    start_time: time = Field(..., description="Время начала работы")
-    end_time: time = Field(..., description="Время окончания работы")
-
-    class Config:
-        from_attributes = True
+    id: int
+    owner_id: int
+    owner_type: str
+    day_of_week: int
+    start_time: time
+    end_time: time
 
 
-class ScheduleTemplateListResponse(ScheduleBaseModel):
-    """Схема для списка шаблонов расписания с пагинацией."""
-    
+class ScheduleTemplatesListResponse(ScheduleBaseModel):
+    """Список шаблонов.
+
+    Ключ templates, а не items: этот тип уже указан в response_model
+    роутера, и переименование тихо сломало бы контракт.
+    """
     templates: List[ScheduleTemplateResponse]
-    total: int = Field(..., description="Общее количество записей")
-    skip: int = Field(..., description="Пропущенное количество записей")
-    limit: int = Field(..., description="Лимит записей")
+    total: int
+    skip: int
+    limit: int
 
 
 class ScheduleTemplatesBulkCreateRequest(ScheduleBaseModel):
-    """Схема для массового создания шаблонов расписания."""
-    
     templates: List[ScheduleTemplateCreate] = Field(
-        ..., 
-        min_length=1,
-        max_length=168,  # Максимум 7 дней * 24 часа
-        description="Список шаблонов для массового создания"
+        ..., min_length=1, max_length=168,
+        description="Шаблоны для массового создания (до 7 дней × 24 интервала)",
     )
 
 
 class ScheduleTemplatesBulkResponse(ScheduleBaseModel):
-    """Ответ на запрос массового создания шаблонов."""
-    
-    created_count: int = Field(..., description="Количество успешно созданных шаблонов")
-    failed_templates: List[dict] = Field(
-        default_factory=list, 
-        description="Список шаблонов с ошибками валидации"
-    )
+    created_count: int
+    failed_templates: List[dict] = Field(default_factory=list)
 
 
 # ============================================================================
-# Schedule Exception schemas (исключения из расписания)
+# Exceptions: выходные и изменённые часы работы
 # ============================================================================
 
-class ScheduleExceptionBase(ScheduleBaseModel):
-    """Базовая схема для исключения из расписания."""
-    
-    date: date = Field(
-        ..., 
-        description="Дата исключения",
-        examples=["2024-12-31"]
-    )
-
-
-class ScheduleExceptionCreate(ScheduleExceptionBase):
-    """Схема для создания нового исключения из расписания."""
-    
-    owner_id: int = Field(..., description="ID владельца", gt=0)
+class ScheduleExceptionCreate(ScheduleBaseModel):
+    owner_id: int = Field(..., gt=0, description="ID владельца")
     owner_type: ScheduleOwnerType = Field(..., description="Тип владельца")
-    is_day_off: bool = Field(
-        False, 
-        description="Является ли день выходным (True = полный выходной)"
-    )
-    custom_start_time: Optional[time] = Field(
-        None, 
-        description="Кастомное время начала работы (если not is_day_off)"
-    )
-    custom_end_time: Optional[time] = Field(
-        None, 
-        description="Кастомное время окончания работы (если not is_day_off)"
-    )
+    date: DateType = Field(..., description="Дата исключения")
+    is_day_off: bool = Field(False, description="Полный выходной")
+    custom_start_time: Optional[time] = Field(None, description="Время начала работы")
+    custom_end_time: Optional[time] = Field(None, description="Время окончания работы")
 
-    @field_validator('custom_start_time', 'custom_end_time')
-    @classmethod
-    def validate_custom_times(cls, v: Optional[time], info) -> Optional[time]:
-        """Проверяет логику кастомных времен при создании исключения."""
-        if info.data.get('is_day_off'):
-            return None  # При выходном дне кастомное время не требуется
-        
-        if not v and not info.data.get('custom_end_time'):
-            raise ValueError(
-                'При is_day_off=False необходимо указать custom_start_time и custom_end_time'
-            )
-        
-        if v and info.data.get('custom_end_time') and v >= info.data['custom_end_time']:
-            raise ValueError(
-                'Время начала работы должно быть строго меньше времени окончания'
-            )
-        
-        return v
+    @model_validator(mode="after")
+    def validate_hours(self) -> "ScheduleExceptionCreate":
+        if self.is_day_off:
+            return self
 
-    @field_validator('owner_id')
-    @classmethod
-    def validate_owner_id(cls, v: int, info) -> int:
-        """Проверяет корректность owner_id."""
-        if v <= 0:
-            raise ValueError('ID владельца должен быть положительным числом')
-        return v
+        if self.custom_start_time is None or self.custom_end_time is None:
+            raise ValueError(
+                "При is_day_off=False нужно указать custom_start_time и custom_end_time"
+            )
+        if self.custom_end_time <= self.custom_start_time:
+            raise ValueError("Время окончания должно быть позже времени начала")
+        return self
 
 
 class ScheduleExceptionUpdate(ScheduleBaseModel):
-    """Схема для обновления исключения из расписания."""
-    
     is_day_off: Optional[bool] = None
-    custom_start_time: Optional[time] = Field(None, description="Кастомное время начала")
-    custom_end_time: Optional[time] = Field(None, description="Кастомное время окончания")
+    custom_start_time: Optional[time] = None
+    custom_end_time: Optional[time] = None
 
-    @field_validator('custom_start_time', 'custom_end_time')
-    @classmethod
-    def validate_custom_times_update(cls, v: Optional[time], info) -> Optional[time]:
-        """Проверяет логику кастомных времен при обновлении."""
-        if info.data.get('is_day_off'):
-            return None
-        
-        if not v and not info.data.get('custom_end_time'):
-            raise ValueError(
-                'При is_day_off=False необходимо указать custom_start_time и custom_end_time'
-            )
-        
-        if v and info.data.get('custom_end_time') and v >= info.data['custom_end_time']:
-            raise ValueError(
-                'Время начала работы должно быть строго меньше времени окончания'
-            )
-        
-        return v
+    @model_validator(mode="after")
+    def validate_hours(self) -> "ScheduleExceptionUpdate":
+        # Проверка частичная: остальные поля могут лежать в БД, поэтому
+        # сверяем только то, что пришло в запросе.
+        if self.is_day_off:
+            return self
+        if self.custom_start_time and self.custom_end_time:
+            if self.custom_end_time <= self.custom_start_time:
+                raise ValueError("Время окончания должно быть позже времени начала")
+        return self
 
 
 class ScheduleExceptionResponse(ScheduleBaseModel):
-    """Схема ответа с данными исключения из расписания."""
-    
-    id: int = Field(..., description="Уникальный ID исключения")
-    owner_id: int = Field(..., description="ID владельца")
-    owner_type: str = Field(..., description="Тип владельца")
-    date: date = Field(..., description="Дата исключения")
-    is_day_off: bool = Field(..., description="Является ли день выходным")
-    custom_start_time: Optional[time] = Field(None, description="Кастомное время начала")
-    custom_end_time: Optional[time] = Field(None, description="Кастомное время окончания")
-
-    class Config:
-        from_attributes = True
+    id: int
+    owner_id: int
+    owner_type: str
+    date: DateType
+    is_day_off: bool
+    custom_start_time: Optional[time] = None
+    custom_end_time: Optional[time] = None
 
 
 class ScheduleExceptionListResponse(ScheduleBaseModel):
-    """Схема для списка исключений из расписания с пагинацией."""
-    
     exceptions: List[ScheduleExceptionResponse]
-    total: int = Field(..., description="Общее количество записей")
-    skip: int = Field(..., description="Пропущенное количество записей")
-    limit: int = Field(..., description="Лимит записей")
+    total: int
+    skip: int
+    limit: int
 
 
 # ============================================================================
-# Schedule Block schemas (блокировки временных слотов)
+# Blocks: ручная блокировка интервала
 # ============================================================================
-
-class ScheduleBlockBase(ScheduleBaseModel):
-    """Базовая схема для блокировки временного слота."""
-    
-    start_datetime: date = Field(
-        ..., 
-        description="Дата начала блокировки",
-        examples=["2024-12-25"]
-    )
-    end_datetime: date = Field(
-        ..., 
-        description="Дата окончания блокировки",
-        examples=["2024-12-26"]
-    )
-
-    @field_validator('end_datetime')
-    @classmethod
-    def validate_end_after_start(cls, v: date, info) -> date:
-        """Проверяет, что дата окончания строго после даты начала."""
-        if v <= info.data.get('start_datetime'):
-            raise ValueError('Дата окончания должна быть строго после даты начала')
-        return v
-
 
 class ScheduleBlockCreate(ScheduleBaseModel):
-    """Схема для создания новой блокировки слота."""
-    
-    owner_id: int = Field(..., description="ID владельца", gt=0)
+    owner_id: int = Field(..., gt=0, description="ID владельца")
     owner_type: ScheduleOwnerType = Field(..., description="Тип владельца")
-    start_datetime: date = Field(
-        ..., 
-        description="Дата начала блокировки",
-        examples=["2024-12-25"]
-    )
-    end_datetime: date = Field(
-        ..., 
-        description="Дата окончания блокировки",
-        examples=["2024-12-26"]
-    )
+    start_at: datetime = Field(..., description="Начало блокировки (с часовым поясом)")
+    end_at: datetime = Field(..., description="Конец блокировки (с часовым поясом)")
+    reason: Optional[str] = Field(None, max_length=500)
 
-    reason: Optional[str] = Field(
-        None, 
-        max_length=500,
-        description="Причина блокировки (опционально)"
-    )
+    @model_validator(mode="after")
+    def validate_range(self) -> "ScheduleBlockCreate":
+        if self.end_at <= self.start_at:
+            raise ValueError("Конец блокировки должен быть позже начала")
+        return self
 
 
 class ScheduleBlockResponse(ScheduleBaseModel):
-    """Схема ответа с данными блокировки слота."""
-    
-    id: int = Field(..., description="Уникальный ID блокировки")
-    owner_id: int = Field(..., description="ID владельца")
-    owner_type: str = Field(..., description="Тип владельца")
-    start_datetime: date = Field(..., description="Дата начала блокировки")
-    end_datetime: date = Field(..., description="Дата окончания блокировки")
-    reason: Optional[str] = Field(None, description="Причина блокировки")
-
-    class Config:
-        from_attributes = True
+    id: int
+    owner_id: int
+    owner_type: str
+    start_at: datetime
+    end_at: datetime
+    reason: Optional[str] = None
 
 
 class ScheduleBlockListResponse(ScheduleBaseModel):
-    """Схема для списка блокировок слотов с пагинацией."""
-    
     blocks: List[ScheduleBlockResponse]
-    total: int = Field(..., description="Общее количество записей")
-    skip: int = Field(..., description="Пропущенное количество записей")
-    limit: int = Field(..., description="Лимит записей")
+    total: int
+    skip: int
+    limit: int
 
 
 # ============================================================================
-# Query parameter schemas
+# Общие параметры запроса
 # ============================================================================
 
 class ScheduleQueryParams(ScheduleBaseModel):
-    """Схема для query параметров при запросе расписания."""
-    
-    owner_id: Optional[int] = Field(None, description="Фильтр по ID владельца")
-    owner_type: Optional[ScheduleOwnerType] = Field(
-        None, 
-        description="Фильтр по типу владельца"
-    )
-    day_of_week: Optional[DayOfWeek] = Field(
-        None, 
-        description="Фильтр по дню недели (для шаблонов)"
-    )
-    date_from: Optional[date] = Field(None, description="Дата начала фильтрации")
-    date_to: Optional[date] = Field(None, description="Дата конца фильтрации")
+    owner_id: Optional[int] = None
+    owner_type: Optional[ScheduleOwnerType] = None
+    day_of_week: Optional[DayOfWeek] = None
+    date_from: Optional[DateType] = None
+    date_to: Optional[DateType] = None
 
 
 class PaginationParams(ScheduleBaseModel):
-    """Схема для пагинационных параметров."""
-    
     skip: int = Field(0, ge=0, description="Пропустить N записей")
     limit: int = Field(100, ge=1, le=1000, description="Максимум записей")

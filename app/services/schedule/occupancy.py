@@ -224,6 +224,29 @@ async def occupy_items(
             raise
 
 
+async def release(db: AsyncSession, *, kind: str, **matches) -> int:
+    """Освобождает занятость по произвольному ключу.
+
+    Используется для блокировок: при удалении ScheduleBlock его интервал
+    должен исчезнуть из-под constraint в той же транзакции.
+    """
+    conditions = ["released_at IS NULL", "kind = :kind"]
+    params = {"kind": kind}
+
+    for column, value in matches.items():
+        conditions.append(f"{column} = :{column}")
+        params[column] = value
+
+    result = await db.execute(
+        text(
+            "UPDATE resource_occupancy SET released_at = now() "
+            f"WHERE {' AND '.join(conditions)}"
+        ),
+        params,
+    )
+    return result.rowcount or 0
+
+
 async def release_order(db: AsyncSession, order_id: int) -> int:
     """Освобождает слоты заказа. Возвращает число освобождённых интервалов.
 

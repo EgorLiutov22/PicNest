@@ -1,103 +1,165 @@
 """
-Сервисы для модуля управления расписанием PicNest.
+Сервисы модуля расписания PicNest.
 
-Этот модуль содержит бизнес-логику и сервисные функции для работы с:
-- Недельными шаблонами расписания (ScheduleTemplate)
-- Исключениями из расписания (ScheduleException)
-- Блокировками временных слотов (ScheduleBlock)
+Три сущности:
+- ScheduleTemplate — недельный график работы (7 строк на ресурс, конфиг);
+- ScheduleException — выходной или особые часы на конкретную дату;
+- ScheduleBlock — ручная блокировка интервала.
 
-Сервисы обеспечивают:
-- Валидацию данных на уровне приложения
-- Проверку пересечений при создании блокировок
-- RBAC проверки для фотографов и представителей студий
-- Транзакционную целостность операций с базой данных
+Блокировка пишется ещё и в resource_occupancy, поэтому конфликт с бронью
+ловит exclusion constraint, а не проверка перед вставкой. Шаблоны в
+занятость не разворачиваются: это конфиг, а не занятые слоты.
 """
 
-from datetime import date, time, datetime
-from typing import List, Optional, Tuple, Any
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, and_
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import select, func, and_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import AppError
+from app.core.exceptions import AppException
+from app.models.photographerprofile import PhotographerProfile
+from app.models.schedule import ScheduleBlock, ScheduleException, ScheduleTemplate
+from app.models.studioprofile import StudioProfile
+from app.models.studioroom import StudioRoom
+from app.services.schedule.occupancy import SlotTakenError, occupy, release, _to_utc
 
 
 # ============================================================================
-# Custom exceptions for schedule module
+# Исключения модуля
 # ============================================================================
 
-class ScheduleValidationError(AppError):
-    """Ошибка валидации данных расписания."""
-    status_code = 400
+class ScheduleError(AppException):
+    """Базовое исключение модуля расписания."""
+
+    def __init__(self, detail: str, error_code: str, status_code: int):
+        super().__init__(detail=detail, error_code=error_code)
+        self.status_code = status_code
 
 
-class ScheduleConflictError(AppError):
-    """Конфликт при создании/обновлении расписания (пересечения)."""
-    status_code = 409
+class ScheduleValidationError(ScheduleError):
+    """Некорректные данные расписания."""
+
+    def __init__(self, detail: str, error_code: str = "SCHEDULE_VALIDATION_ERROR"):
+        super().__init__(detail, error_code, 400)
 
 
-class ScheduleAccessDeniedError(AppError):
-    """Отказ в доступе к управлению чужим расписанием."""
-    status_code = 403
+class ScheduleConflictError(ScheduleError):
+    """Конфликт: пересечение интервалов или дубль записи."""
+
+    def __init__(self, detail: str, error_code: str = "SCHEDULE_CONFLICT"):
+        super().__init__(detail, error_code, 409)
 
 
-class ScheduleNotFoundError(AppError):
+class ScheduleAccessDeniedError(ScheduleError):
+    """Чужое расписание."""
+
+    def __init__(self, detail: str, error_code: str = "SCHEDULE_ACCESS_DENIED"):
+        super().__init__(detail, error_code, 403)
+
+
+class ScheduleNotFoundError(ScheduleError):
     """Запись расписания не найдена."""
-    status_code = 404
+
+    def __init__(self, detail: str, error_code: str = "SCHEDULE_NOT_FOUND"):
+        super().__init__(detail, error_code, 404)
+
+
+# pgcode unique_violation: так приходит нарушение частичного уникального
+# индекса по (владелец, день недели).
+UNIQUE_VIOLATION = "23505"
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    return getattr(getattr(exc, "orig", None), "pgcode", None) == UNIQUE_VIOLATION
 
 
 # ============================================================================
-# Helper functions for time validation and comparison
+# Владение ресурсом
 # ============================================================================
 
-def validate_time_range(start: time, end: time) -> bool:
-    """Проверяет, что время начала строго меньше времени окончания.
-    
-    Args:
-        start: Время начала
-        end: Время окончания
-        
-    Returns:
-        True если диапазон валиден
-        
-    Raises:
-        ScheduleValidationError: Если время некорректно
+OWNER_COLUMNS = {
+    "photographer": "photographer_id",
+    "room": "room_id",
+}
+
+
+async def ensure_owner_access(
+    db: AsyncSession,
+    owner_id: int,
+    owner_type: str,
+    user_id: Optional[str],
+) -> None:
+    """Проверяет, что профиль/зал существует и принадлежит пользователю.
+
+    Проверка идёт по цепочке пользователь -> профиль студии -> зал:
+    у User нет поля studio_profile_id, а привязка живёт в StudioProfile.
     """
-    if start >= end:
-        raise ScheduleValidationError(
-            status_code=400,
-            detail="Время начала работы должно быть строго меньше времени окончания"
+    if owner_type == "photographer":
+        result = await db.execute(
+            select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
         )
-    return True
+        owner = result.scalar_one_or_none()
+        if owner is None:
+            raise ScheduleNotFoundError(
+                f"Фотограф с id={owner_id} не найден", "PHOTOGRAPHER_NOT_FOUND"
+            )
+        if user_id is not None and str(owner.user_id) != str(user_id):
+            raise ScheduleAccessDeniedError(
+                "Фотограф может управлять только своим расписанием", "OWN_PROFILE_ONLY"
+            )
+        return
+
+    if owner_type == "room":
+        result = await db.execute(
+            select(StudioRoom).where(StudioRoom.id == owner_id)
+        )
+        room = result.scalar_one_or_none()
+        if room is None:
+            raise ScheduleNotFoundError(f"Зал с id={owner_id} не найден", "ROOM_NOT_FOUND")
+
+        if user_id is not None:
+            result = await db.execute(
+                select(StudioProfile).where(StudioProfile.id == room.studio_id)
+            )
+            studio = result.scalar_one_or_none()
+            if studio is None or str(studio.user_id) != str(user_id):
+                raise ScheduleAccessDeniedError(
+                    "Представитель студии может управлять только своими залами",
+                    "OWN_ROOMS_ONLY",
+                )
+        return
+
+    raise ScheduleValidationError(
+        f"Некорректный тип владельца: {owner_type}", "INVALID_OWNER_TYPE"
+    )
 
 
-def validate_date_range(start: date, end: date) -> bool:
-    """Проверяет, что дата начала строго меньше даты окончания.
-    
-    Args:
-        start: Дата начала
-        end: Дата окончания
-        
-    Returns:
-        True если диапазон валиден
-        
-    Raises:
-        ScheduleValidationError: Если дата некорректна
-    """
-    if start >= end:
+def owner_fields(owner_id: int, owner_type: str) -> Dict[str, Any]:
+    """Поля владельца для создания записи."""
+    if owner_type not in OWNER_COLUMNS:
         raise ScheduleValidationError(
-            status_code=400,
-            detail="Дата начала должна быть строго меньше даты окончания"
+            f"Некорректный тип владельца: {owner_type}", "INVALID_OWNER_TYPE"
         )
-    return True
+    return {
+        "photographer_id": owner_id if owner_type == "photographer" else None,
+        "room_id": owner_id if owner_type == "room" else None,
+    }
+
+
+def _owner_of(row) -> Tuple[int, str]:
+    """Обратное преобразование: возвращает (owner_id, owner_type)."""
+    if row.photographer_id is not None:
+        return row.photographer_id, "photographer"
+    return row.room_id, "room"
 
 
 # ============================================================================
-# Schedule Template Service
+# Шаблоны
 # ============================================================================
 
 class ScheduleTemplateService:
-    """Сервис для управления недельными шаблонами расписания."""
 
     @staticmethod
     async def create_template(
@@ -107,1340 +169,438 @@ class ScheduleTemplateService:
         day_of_week: int,
         start_time: time,
         end_time: time,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Создаёт новый шаблон расписания.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            owner_id: ID владельца (photographer_profile.id или room.id)
-            owner_type: Тип владельца ('photographer' или 'room')
-            day_of_week: День недели (1-7)
-            start_time: Время начала работы
-            end_time: Время окончания работы
-            user_id: ID текущего пользователя для проверки прав доступа
-            
-        Returns:
-            Созданная запись шаблона расписания
-            
-        Raises:
-            ScheduleValidationError: Если время некорректно или день недели вне диапазона
-            ScheduleAccessDeniedError: Если пользователь не имеет прав на создание
-            ScheduleNotFoundError: Если владелец не найден
-        """
-        # Валидация времени
-        validate_time_range(start_time, end_time)
-        
-        if not 1 <= day_of_week <= 7:
+        user_id: Optional[str] = None,
+    ) -> ScheduleTemplate:
+        if end_time <= start_time:
             raise ScheduleValidationError(
-                status_code=400,
-                detail="День недели должен быть в диапазоне от 1 до 7"
+                "Время окончания должно быть строго после времени начала",
+                "INVALID_TIME_RANGE",
             )
 
-        # Загрузка модели для проверки существования владельца
-        from app.models.sheduletemplate import ScheduleTemplate
-        
-        if owner_type == 'photographer':
-            from app.models.photographerprofile import PhotographerProfile
-            result = await db.execute(
-                select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
-            )
-            owner = result.scalar_one_or_none()
-            
-            # Проверка прав доступа для фотографов
-            if user_id and owner:
-                if str(owner.user_id) != user_id:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="Фотограф может редактировать только своё расписание"
-                    )
-        elif owner_type == 'room':
-            from app.models.studioroom import StudioRoom
-            result = await db.execute(
-                select(StudioRoom).where(StudioRoom.id == owner_id)
-            )
-            room = result.scalar_one_or_none()
-            
-            # Проверка прав доступа для представителей студий
-            if user_id and room:
-                from app.models.studioprofile import StudioProfile
-                studio_result = await db.execute(
-                    select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                )
-                studio = studio_result.scalar_one_or_none()
-                
-                # Проверяем, что пользователь является представителем студии
-                from app.models.user import User
-                user_result = await db.execute(
-                    select(User).where(User.id == user_id)
-                )
-                current_user = user_result.scalar_one_or_none()
-                
-                if current_user and (current_user.role != 'studio' or 
-                                     str(current_user.studio_profile_id) != str(room.studio_id)):
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="Представитель студии может управлять расписанием только своих залов"
-                    )
-        else:
-            raise ScheduleValidationError(
-                status_code=400,
-                detail="Некорректный тип владельца"
-            )
+        await ensure_owner_access(db, owner_id, owner_type, user_id)
 
-        if not owner and not room:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Владелец (owner_id={owner_id}, type={owner_type}) не найден"
-            )
-
-        # Создание записи шаблона
         template = ScheduleTemplate(
-            photographer_id=owner_id if owner_type == 'photographer' else None,
-            room_id=owner_id if owner_type == 'room' else None,
+            **owner_fields(owner_id, owner_type),
             day_of_week=day_of_week,
             start_time=start_time,
             end_time=end_time,
         )
-        
         db.add(template)
-        await db.commit()
-        await db.refresh(template)
+
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            raise ScheduleConflictError(
+                f"Расписание на этот день уже задано (day_of_week={day_of_week})",
+                "TEMPLATE_ALREADY_EXISTS",
+            ) from exc
 
         return template
 
     @staticmethod
     async def get_template(
-        db: AsyncSession, 
-        template_id: int,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Получает шаблон расписания по ID.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            template_id: ID шаблона
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Запись шаблона или None если не найдена/нет прав
-            
-        Raises:
-            ScheduleNotFoundError: Если шаблон не найден и пользователь администратор
-        """
-        from app.models.sheduletemplate import ScheduleTemplate
-        
+        db: AsyncSession, template_id: int, user_id: Optional[str] = None
+    ) -> ScheduleTemplate:
         result = await db.execute(
             select(ScheduleTemplate).where(ScheduleTemplate.id == template_id)
         )
         template = result.scalar_one_or_none()
-
-        if not template:
+        if template is None:
             raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Шаблон расписания с ID {template_id} не найден"
+                f"Шаблон с id={template_id} не найден", "TEMPLATE_NOT_FOUND"
             )
 
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                # Обычный пользователь может видеть только своё расписание
-                is_owner = False
-                
-                if template.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == template.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif template.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == template.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на просмотр этого шаблона расписания"
-                    )
-
+        owner_id, owner_type = _owner_of(template)
+        await ensure_owner_access(db, owner_id, owner_type, user_id)
         return template
 
     @staticmethod
     async def get_templates_by_owner(
         db: AsyncSession,
-        owner_id: int,
+        owner_id: Optional[int],
         owner_type: str,
         user_id: Optional[str] = None,
         day_of_week: Optional[int] = None,
         skip: int = 0,
-        limit: int = 100
-    ) -> Tuple[List[Any], int]:
-        """Получает список шаблонов расписания для владельца.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            owner_id: ID владельца
-            owner_type: Тип владельца
-            user_id: ID текущего пользователя
-            day_of_week: Фильтр по дню недели (опционально)
-            skip: Количество записей для пропуска
-            limit: Максимальное количество записей
-            
-        Returns:
-            Кортеж из списка шаблонов и общего количества
-        """
-        from app.models.sheduletemplate import ScheduleTemplate
-        
-        query = select(ScheduleTemplate).where(
-            or_(
-                and_(ScheduleTemplate.photographer_id == owner_id, ScheduleTemplate.room_id.is_(None)),
-                and_(ScheduleTemplate.room_id == owner_id, ScheduleTemplate.photographer_id.is_(None))
-            )
-        )
-        
+        limit: int = 100,
+    ) -> Tuple[List[ScheduleTemplate], int]:
+        if owner_id is not None:
+            await ensure_owner_access(db, owner_id, owner_type, user_id)
+            conditions = [getattr(ScheduleTemplate, OWNER_COLUMNS[owner_type]) == owner_id]
+        else:
+            # Без owner_id показываем только своё: иначе пользователь
+            # увидел бы чужой график перебором id.
+            conditions = [await _own_condition(db, ScheduleTemplate, owner_type, user_id)]
+
         if day_of_week is not None:
-            query = query.where(ScheduleTemplate.day_of_week == day_of_week)
+            conditions.append(ScheduleTemplate.day_of_week == day_of_week)
 
-        # Проверка прав доступа
-        if user_id:
-            from app.models.user import User
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_accessible = False
-                
-                if owner_type == 'photographer':
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    is_accessible = (photographer and str(photographer.user_id) == user_id)
-                    
-                elif owner_type == 'room':
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == owner_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        is_accessible = (studio and str(studio.user_id) == user_id)
+        where = and_(*conditions)
 
-                if not is_accessible:
-                    return [], 0
-        
-        # Получение общего количества
-        count_query = select(func.count()).select_from(query.subquery())
-        total_result = await db.execute(count_query)
-        total = total_result.scalar() or 0
+        total = (
+            await db.execute(select(func.count(ScheduleTemplate.id)).where(where))
+        ).scalar() or 0
 
-        query = query.offset(skip).limit(limit)
-        result = await db.execute(query)
-        templates = result.scalars().all()
-
-        return list(templates), total
+        result = await db.execute(
+            select(ScheduleTemplate)
+            .where(where)
+            .order_by(ScheduleTemplate.day_of_week)
+            .offset(skip)
+            .limit(limit)
+        )
+        return list(result.scalars().all()), total
 
     @staticmethod
     async def update_template(
         db: AsyncSession,
         template_id: int,
-        updates: dict,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Обновляет существующий шаблон расписания.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            template_id: ID шаблона для обновления
-            updates: Словарь с полями для обновления
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Обновленная запись шаблона
-            
-        Raises:
-            ScheduleNotFoundError: Если шаблон не найден
-            ScheduleAccessDeniedError: Если нет прав на обновление
-            ScheduleValidationError: Если данные некорректны
-        """
-        from app.models.sheduletemplate import ScheduleTemplate
-        
-        # Получение существующего шаблона
-        result = await db.execute(
-            select(ScheduleTemplate).where(ScheduleTemplate.id == template_id)
-        )
-        template = result.scalar_one_or_none()
+        updates: Dict[str, Any],
+        user_id: Optional[str] = None,
+    ) -> ScheduleTemplate:
+        template = await ScheduleTemplateService.get_template(db, template_id, user_id)
 
-        if not template:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Шаблон расписания с ID {template_id} не найден"
-            )
+        for field in ("day_of_week", "start_time", "end_time"):
+            if field in updates and updates[field] is not None:
+                setattr(template, field, updates[field])
 
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if template.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == template.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif template.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == template.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на обновление этого шаблона расписания"
-                    )
-
-        # Валидация обновляемых полей
-        if 'start_time' in updates and 'end_time' in updates:
-            validate_time_range(updates['start_time'], updates['end_time'])
-        elif 'start_time' in updates or 'end_time' in updates:
+        if template.end_time <= template.start_time:
             raise ScheduleValidationError(
-                status_code=400,
-                detail="Необходимо обновлять start_time и end_time одновременно"
+                "Время окончания должно быть строго после времени начала",
+                "INVALID_TIME_RANGE",
             )
 
-        if 'day_of_week' in updates and not 1 <= updates['day_of_week'] <= 7:
-            raise ScheduleValidationError(
-                status_code=400,
-                detail="День недели должен быть в диапазоне от 1 до 7"
-            )
-
-        # Применение обновлений
-        for field, value in updates.items():
-            if hasattr(template, field):
-                setattr(template, field, value)
-
-        await db.commit()
-        await db.refresh(template)
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            raise ScheduleConflictError(
+                "Расписание на этот день уже задано", "TEMPLATE_ALREADY_EXISTS"
+            ) from exc
 
         return template
 
     @staticmethod
     async def delete_template(
-        db: AsyncSession, 
-        template_id: int, 
-        user_id: Optional[str] = None
-    ) -> bool:
-        """Удаляет шаблон расписания.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            template_id: ID шаблона для удаления
-            user_id: ID текущего пользователя
-            
-        Returns:
-            True если успешно удален
-            
-        Raises:
-            ScheduleNotFoundError: Если шаблон не найден
-            ScheduleAccessDeniedError: Если нет прав на удаление
-        """
-        from app.models.sheduletemplate import ScheduleTemplate
-        
-        result = await db.execute(
-            select(ScheduleTemplate).where(ScheduleTemplate.id == template_id)
-        )
-        template = result.scalar_one_or_none()
-
-        if not template:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Шаблон расписания с ID {template_id} не найден"
-            )
-
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if template.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == template.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif template.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == template.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на удаление этого шаблона расписания"
-                    )
-
+        db: AsyncSession, template_id: int, user_id: Optional[str] = None
+    ) -> None:
+        template = await ScheduleTemplateService.get_template(db, template_id, user_id)
         await db.delete(template)
-        await db.commit()
+        await db.flush()
 
-        return True
+
+async def _own_condition(db: AsyncSession, model, owner_type: str, user_id: Optional[str]):
+    """Условие «записи принадлежат этому пользователю»."""
+    if user_id is None:
+        # Без пользователя отдавать нечего; заведомо ложное условие
+        # дешевле отдельной ветки с пустым результатом.
+        return model.id.is_(None)
+
+    if owner_type == "photographer":
+        profile_ids = select(PhotographerProfile.id).where(
+            PhotographerProfile.user_id == user_id
+        )
+        return model.photographer_id.in_(profile_ids)
+
+    room_ids = select(StudioRoom.id).where(
+        StudioRoom.studio_id.in_(
+            select(StudioProfile.id).where(StudioProfile.user_id == user_id)
+        )
+    )
+    return model.room_id.in_(room_ids)
 
 
 # ============================================================================
-# Schedule Exception Service
+# Исключения из расписания
 # ============================================================================
 
 class ScheduleExceptionService:
-    """Сервис для управления исключениями из расписания."""
 
     @staticmethod
     async def create_exception(
         db: AsyncSession,
         owner_id: int,
         owner_type: str,
-        date_: date,
+        exception_date: date,
         is_day_off: bool = False,
         custom_start_time: Optional[time] = None,
         custom_end_time: Optional[time] = None,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Создаёт исключение из расписания для конкретной даты.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            owner_id: ID владельца
-            owner_type: Тип владельца
-            date_: Дата исключения
-            is_day_off: Является ли день выходным
-            custom_start_time: Кастомное время начала (если not day off)
-            custom_end_time: Кастомное время окончания (если not day off)
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Созданная запись исключения
-            
-        Raises:
-            ScheduleValidationError: Если данные некорректны
-            ScheduleAccessDeniedError: Если нет прав на создание
-            ScheduleNotFoundError: Если владелец не найден
-        """
-        # Валидация логики дня выходного/рабочего
-        if is_day_off:
-            if custom_start_time or custom_end_time:
+        user_id: Optional[str] = None,
+    ) -> ScheduleException:
+        if not is_day_off:
+            if custom_start_time is None or custom_end_time is None:
                 raise ScheduleValidationError(
-                    status_code=400,
-                    detail="Для дня выходного (is_day_off=True) нельзя указывать кастомное время"
+                    "При is_day_off=False нужно указать время работы",
+                    "MISSING_WORKING_HOURS",
                 )
-        else:
-            if not custom_start_time or not custom_end_time:
+            if custom_end_time <= custom_start_time:
                 raise ScheduleValidationError(
-                    status_code=400,
-                    detail="При is_day_off=False необходимо указать custom_start_time и custom_end_time"
+                    "Время окончания должно быть позже времени начала",
+                    "INVALID_TIME_RANGE",
                 )
-            
-            validate_time_range(custom_start_time, custom_end_time)
 
-        # Проверка существования владельца
-        if owner_type == 'photographer':
-            from app.models.photographerprofile import PhotographerProfile
-            result = await db.execute(
-                select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
-            )
-            owner = result.scalar_one_or_none()
-            
-            # Проверка прав доступа
-            if user_id and owner:
-                if str(owner.user_id) != user_id:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="Фотограф может редактировать только своё расписание"
-                    )
-        elif owner_type == 'room':
-            from app.models.studioroom import StudioRoom
-            result = await db.execute(
-                select(StudioRoom).where(StudioRoom.id == owner_id)
-            )
-            room = result.scalar_one_or_none()
-            
-            # Проверка прав доступа
-            if user_id and room:
-                from app.models.studioprofile import StudioProfile
-                studio_result = await db.execute(
-                    select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                )
-                studio = studio_result.scalar_one_or_none()
-                
-                from app.models.user import User
-                user_result = await db.execute(select(User).where(User.id == user_id))
-                current_user = user_result.scalar_one_or_none()
-                
-                if current_user and (current_user.role != 'studio' or 
-                                     str(current_user.studio_profile_id) != str(room.studio_id)):
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="Представитель студии может управлять расписанием только своих залов"
-                    )
-        else:
-            raise ScheduleValidationError(
-                status_code=400,
-                detail="Некорректный тип владельца"
-            )
+        await ensure_owner_access(db, owner_id, owner_type, user_id)
 
-        if not owner and not room:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Владелец (owner_id={owner_id}, type={owner_type}) не найден"
-            )
-
-        # Проверка на дубликаты (одна запись на одну дату для одного владельца)
-        from app.models.shesuleexception import ScheduleException
-        
-        duplicate_query = select(ScheduleException).where(
-            or_(
-                and_(ScheduleException.photographer_id == owner_id, 
-                     ScheduleException.room_id.is_(None)),
-                and_(ScheduleException.room_id == owner_id, 
-                     ScheduleException.photographer_id.is_(None))
-            ),
-            ScheduleException.date == date_
-        )
-        
-        duplicate_result = await db.execute(duplicate_query)
-        if duplicate_result.scalar_one_or_none():
-            raise ScheduleConflictError(
-                status_code=409,
-                detail=f"Для владельца {owner_type} с ID {owner_id} уже существует исключение на дату {date_}"
-            )
-
-        # Создание записи исключения
         exception = ScheduleException(
-            photographer_id=owner_id if owner_type == 'photographer' else None,
-            room_id=owner_id if owner_type == 'room' else None,
-            date=date_,
+            **owner_fields(owner_id, owner_type),
+            date=exception_date,
             is_day_off=is_day_off,
-            custom_start_time=custom_start_time,
-            custom_end_time=custom_end_time,
+            # При выходном дне часы не храним: иначе после смены
+            # is_day_off на False остались бы устаревшие значения.
+            custom_start_time=None if is_day_off else custom_start_time,
+            custom_end_time=None if is_day_off else custom_end_time,
         )
-        
         db.add(exception)
-        await db.commit()
-        await db.refresh(exception)
-
+        await db.flush()
         return exception
 
     @staticmethod
     async def get_exception(
-        db: AsyncSession, 
-        exception_id: int,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Получает исключение из расписания по ID.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            exception_id: ID исключения
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Запись исключения или None если не найдена/нет прав
-        """
-        from app.models.shesuleexception import ScheduleException
-        
+        db: AsyncSession, exception_id: int, user_id: Optional[str] = None
+    ) -> ScheduleException:
         result = await db.execute(
             select(ScheduleException).where(ScheduleException.id == exception_id)
         )
         exception = result.scalar_one_or_none()
-
-        if not exception:
+        if exception is None:
             raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Исключение из расписания с ID {exception_id} не найдено"
+                f"Исключение с id={exception_id} не найдено", "EXCEPTION_NOT_FOUND"
             )
 
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if exception.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == exception.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif exception.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == exception.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на просмотр этого исключения"
-                    )
-
+        owner_id, owner_type = _owner_of(exception)
+        await ensure_owner_access(db, owner_id, owner_type, user_id)
         return exception
 
     @staticmethod
     async def get_exceptions_by_owner(
         db: AsyncSession,
-        owner_id: int,
+        owner_id: Optional[int],
         owner_type: str,
         user_id: Optional[str] = None,
         date_from: Optional[date] = None,
         date_to: Optional[date] = None,
         skip: int = 0,
-        limit: int = 100
-    ) -> Tuple[List[Any], int]:
-        """Получает список исключений из расписания для владельца.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            owner_id: ID владельца
-            owner_type: Тип владельца
-            user_id: ID текущего пользователя
-            date_from: Фильтр по дате начала
-            date_to: Фильтр по дате окончания
-            skip: Количество записей для пропуска
-            limit: Максимальное количество записей
-            
-        Returns:
-            Кортеж из списка исключений и общего количества
-        """
-        from app.models.shesuleexception import ScheduleException
-        
-        query = select(ScheduleException).where(
-            or_(
-                and_(ScheduleException.photographer_id == owner_id, ScheduleException.room_id.is_(None)),
-                and_(ScheduleException.room_id == owner_id, ScheduleException.photographer_id.is_(None))
-            )
+        limit: int = 100,
+    ) -> Tuple[List[ScheduleException], int]:
+        if owner_id is not None:
+            await ensure_owner_access(db, owner_id, owner_type, user_id)
+            conditions = [getattr(ScheduleException, OWNER_COLUMNS[owner_type]) == owner_id]
+        else:
+            conditions = [await _own_condition(db, ScheduleException, owner_type, user_id)]
+
+        if date_from is not None:
+            conditions.append(ScheduleException.date >= date_from)
+        if date_to is not None:
+            conditions.append(ScheduleException.date <= date_to)
+
+        where = and_(*conditions)
+
+        total = (
+            await db.execute(select(func.count(ScheduleException.id)).where(where))
+        ).scalar() or 0
+
+        result = await db.execute(
+            select(ScheduleException)
+            .where(where)
+            .order_by(ScheduleException.date)
+            .offset(skip)
+            .limit(limit)
         )
-
-        if date_from:
-            query = query.where(ScheduleException.date >= date_from)
-        
-        if date_to:
-            query = query.where(ScheduleException.date <= date_to)
-
-        # Проверка прав доступа
-        if user_id:
-            from app.models.user import User
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_accessible = False
-                
-                if owner_type == 'photographer':
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    is_accessible = (photographer and str(photographer.user_id) == user_id)
-                    
-                elif owner_type == 'room':
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == owner_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        is_accessible = (studio and str(studio.user_id) == user_id)
-
-                if not is_accessible:
-                    return [], 0
-        
-        # Получение общего количества
-        count_query = select(func.count()).select_from(query.subquery())
-        total_result = await db.execute(count_query)
-        total = total_result.scalar() or 0
-
-        query = query.offset(skip).limit(limit)
-        result = await db.execute(query)
-        exceptions = result.scalars().all()
-
-        return list(exceptions), total
+        return list(result.scalars().all()), total
 
     @staticmethod
     async def update_exception(
         db: AsyncSession,
         exception_id: int,
-        updates: dict,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Обновляет исключение из расписания.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            exception_id: ID исключения для обновления
-            updates: Словарь с полями для обновления
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Обновленная запись исключения
-        """
-        from app.models.shesuleexception import ScheduleException
-        
-        result = await db.execute(
-            select(ScheduleException).where(ScheduleException.id == exception_id)
+        updates: Dict[str, Any],
+        user_id: Optional[str] = None,
+    ) -> ScheduleException:
+        exception = await ScheduleExceptionService.get_exception(
+            db, exception_id, user_id
         )
-        exception = result.scalar_one_or_none()
 
-        if not exception:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Исключение из расписания с ID {exception_id} не найдено"
-            )
+        for field in ("is_day_off", "custom_start_time", "custom_end_time"):
+            if field in updates:
+                setattr(exception, field, updates[field])
 
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if exception.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == exception.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif exception.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == exception.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на обновление этого исключения"
-                    )
-
-        # Валидация обновляемых полей
-        if 'is_day_off' in updates and 'custom_start_time' in updates:
-            if updates['is_day_off'] and updates['custom_start_time']:
+        if exception.is_day_off:
+            exception.custom_start_time = None
+            exception.custom_end_time = None
+        else:
+            if exception.custom_start_time is None or exception.custom_end_time is None:
                 raise ScheduleValidationError(
-                    status_code=400,
-                    detail="Для дня выходного нельзя указывать кастомное время"
+                    "При is_day_off=False нужно указать время работы",
+                    "MISSING_WORKING_HOURS",
                 )
-        
-        if not updates.get('is_day_off') and ('custom_start_time' in updates or 'custom_end_time' in updates):
-            custom_start = updates.get('custom_start_time', exception.custom_start_time)
-            custom_end = updates.get('custom_end_time', exception.custom_end_time)
-            
-            if custom_start and custom_end:
-                validate_time_range(custom_start, custom_end)
+            if exception.custom_end_time <= exception.custom_start_time:
+                raise ScheduleValidationError(
+                    "Время окончания должно быть позже времени начала",
+                    "INVALID_TIME_RANGE",
+                )
 
-        # Применение обновлений
-        for field, value in updates.items():
-            if hasattr(exception, field):
-                setattr(exception, field, value)
-
-        await db.commit()
-        await db.refresh(exception)
-
+        await db.flush()
         return exception
 
     @staticmethod
     async def delete_exception(
-        db: AsyncSession, 
-        exception_id: int, 
-        user_id: Optional[str] = None
-    ) -> bool:
-        """Удаляет исключение из расписания.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            exception_id: ID исключения для удаления
-            user_id: ID текущего пользователя
-            
-        Returns:
-            True если успешно удалено
-        """
-        from app.models.shesuleexception import ScheduleException
-        
-        result = await db.execute(
-            select(ScheduleException).where(ScheduleException.id == exception_id)
+        db: AsyncSession, exception_id: int, user_id: Optional[str] = None
+    ) -> None:
+        exception = await ScheduleExceptionService.get_exception(
+            db, exception_id, user_id
         )
-        exception = result.scalar_one_or_none()
-
-        if not exception:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Исключение из расписания с ID {exception_id} не найдено"
-            )
-
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if exception.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == exception.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif exception.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == exception.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на удаление этого исключения"
-                    )
-
         await db.delete(exception)
-        await db.commit()
-
-        return True
+        await db.flush()
 
 
 # ============================================================================
-# Schedule Block Service (для блокировки слотов)
+# Блокировки
 # ============================================================================
 
 class ScheduleBlockService:
-    """Сервис для управления блокировками временных слотов."""
 
     @staticmethod
     async def create_block(
         db: AsyncSession,
         owner_id: int,
         owner_type: str,
-        start_datetime: date,
-        end_datetime: date,
+        start_at: datetime,
+        end_at: datetime,
         reason: Optional[str] = None,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Создаёт блокировку временного слота.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            owner_id: ID владельца
-            owner_type: Тип владельца
-            start_datetime: Дата начала блокировки
-            end_datetime: Дата окончания блокировки
-            reason: Причина блокировки (опционально)
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Созданная запись блокировки
-            
-        Raises:
-            ScheduleValidationError: Если данные некорректны или есть пересечения
-            ScheduleConflictError: Если блокировка пересекается с существующей
-            ScheduleAccessDeniedError: Если нет прав на создание
-            ScheduleNotFoundError: Если владелец не найден
+        user_id: Optional[str] = None,
+    ) -> ScheduleBlock:
+        """Создаёт блокировку и занимает интервал в resource_occupancy.
+
+        Пересечение с бронью или другой блокировкой ловит constraint, а не
+        SELECT перед вставкой: иначе между проверкой и записью влезает
+        параллельный заказ.
         """
-        # Валидация дат
-        validate_date_range(start_datetime, end_datetime)
+        start_at = _to_utc(start_at)
+        end_at = _to_utc(end_at)
 
-        # Проверка существования владельца и прав доступа
-        if owner_type == 'photographer':
-            from app.models.photographerprofile import PhotographerProfile
-            result = await db.execute(
-                select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
-            )
-            owner = result.scalar_one_or_none()
-            
-            if user_id and owner:
-                if str(owner.user_id) != user_id:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="Фотограф может блокировать только своё расписание"
-                    )
-        elif owner_type == 'room':
-            from app.models.studioroom import StudioRoom
-            result = await db.execute(
-                select(StudioRoom).where(StudioRoom.id == owner_id)
-            )
-            room = result.scalar_one_or_none()
-            
-            if user_id and room:
-                from app.models.studioprofile import StudioProfile
-                studio_result = await db.execute(
-                    select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                )
-                studio = studio_result.scalar_one_or_none()
-                
-                from app.models.user import User
-                user_result = await db.execute(select(User).where(User.id == user_id))
-                current_user = user_result.scalar_one_or_none()
-                
-                if current_user and (current_user.role != 'studio' or 
-                                     str(current_user.studio_profile_id) != str(room.studio_id)):
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="Представитель студии может блокировать только свои залы"
-                    )
-        else:
+        if end_at <= start_at:
             raise ScheduleValidationError(
-                status_code=400,
-                detail="Некорректный тип владельца"
+                "Конец блокировки должен быть позже начала", "INVALID_TIME_RANGE"
             )
 
-        if not owner and not room:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Владелец (owner_id={owner_id}, type={owner_type}) не найден"
-            )
+        await ensure_owner_access(db, owner_id, owner_type, user_id)
 
-        # Проверка на пересечения с существующими блокировками
-        from app.models.sheduletemplate import ScheduleTemplate
-        
-        check_query = select(ScheduleBlock).where(
-            or_(
-                and_(ScheduleBlock.photographer_id == owner_id, 
-                     ScheduleBlock.room_id.is_(None)),
-                and_(ScheduleBlock.room_id == owner_id, 
-                     ScheduleBlock.photographer_id.is_(None))
-            ),
-            or_(
-                # Пересечение по датам
-                and_(
-                    ScheduleBlock.start_datetime <= end_datetime,
-                    ScheduleBlock.end_datetime >= start_datetime
-                )
-            )
-        )
-        
-        check_result = await db.execute(check_query)
-        existing_blocks = check_result.scalars().all()
-        
-        if existing_blocks:
-            raise ScheduleConflictError(
-                status_code=409,
-                detail="Новая блокировка пересекается с существующей блокировкой"
-            )
-
-        # Создание записи блокировки
         block = ScheduleBlock(
-            photographer_id=owner_id if owner_type == 'photographer' else None,
-            room_id=owner_id if owner_type == 'room' else None,
-            start_datetime=start_datetime,
-            end_datetime=end_datetime,
+            **owner_fields(owner_id, owner_type),
+            start_at=start_at,
+            end_at=end_at,
             reason=reason,
         )
-        
         db.add(block)
-        await db.commit()
-        await db.refresh(block)
+        await db.flush()
+
+        # resource_type зала — "studio_room": то же значение, что пишет
+        # создание заказа, иначе бронь и блокировка не увидели бы друг друга.
+        resource_type = "photographer" if owner_type == "photographer" else "studio_room"
+
+        try:
+            # savepoint обязателен: нарушение constraint в PostgreSQL
+            # прерывает всю транзакцию, и следующий SELECT (даже чтобы
+            # прочитать конфликт) падает с PendingRollbackError.
+            async with db.begin_nested():
+                await occupy(
+                    db,
+                    resource_type=resource_type,
+                    resource_id=owner_id,
+                    start_time=start_at,
+                    end_time=end_at,
+                    kind="block",
+                    block_id=block.id,
+                    expires_at=None,
+                )
+        except SlotTakenError as exc:
+            from app.services.schedule.occupancy import find_conflict
+
+            conflict = await find_conflict(
+                db,
+                resource_type=resource_type,
+                resource_id=owner_id,
+                start_time=start_at,
+                end_time=end_at,
+            )
+            raise ScheduleConflictError(
+                f"Интервал пересекается с существующей занятостью: {conflict}",
+                "BLOCK_OVERLAPS_BOOKING",
+            ) from exc
 
         return block
 
     @staticmethod
     async def get_block(
-        db: AsyncSession, 
-        block_id: int,
-        user_id: Optional[str] = None
-    ) -> Any:
-        """Получает блокировку по ID.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            block_id: ID блокировки
-            user_id: ID текущего пользователя
-            
-        Returns:
-            Запись блокировки или None если не найдена/нет прав
-        """
-        from app.models.sheduletemplate import ScheduleBlock
-        
+        db: AsyncSession, block_id: int, user_id: Optional[str] = None
+    ) -> ScheduleBlock:
         result = await db.execute(
             select(ScheduleBlock).where(ScheduleBlock.id == block_id)
         )
         block = result.scalar_one_or_none()
-
-        if not block:
+        if block is None:
             raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Блокировка слота с ID {block_id} не найдена"
+                f"Блокировка с id={block_id} не найдена", "BLOCK_NOT_FOUND"
             )
 
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if block.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == block.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif block.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == block.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на просмотр этой блокировки"
-                    )
-
+        owner_id, owner_type = _owner_of(block)
+        await ensure_owner_access(db, owner_id, owner_type, user_id)
         return block
 
     @staticmethod
     async def get_blocks_by_owner(
         db: AsyncSession,
-        owner_id: int,
+        owner_id: Optional[int],
         owner_type: str,
         user_id: Optional[str] = None,
         date_from: Optional[date] = None,
         date_to: Optional[date] = None,
         skip: int = 0,
-        limit: int = 100
-    ) -> Tuple[List[Any], int]:
-        """Получает список блокировок для владельца.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            owner_id: ID владельца
-            owner_type: Тип владельца
-            user_id: ID текущего пользователя
-            date_from: Фильтр по дате начала
-            date_to: Фильтр по дате окончания
-            skip: Количество записей для пропуска
-            limit: Максимальное количество записей
-            
-        Returns:
-            Кортеж из списка блокировок и общего количества
-        """
-        from app.models.sheduletemplate import ScheduleBlock
-        
-        query = select(ScheduleBlock).where(
-            or_(
-                and_(ScheduleBlock.photographer_id == owner_id, ScheduleBlock.room_id.is_(None)),
-                and_(ScheduleBlock.room_id == owner_id, ScheduleBlock.photographer_id.is_(None))
+        limit: int = 100,
+    ) -> Tuple[List[ScheduleBlock], int]:
+        if owner_id is not None:
+            await ensure_owner_access(db, owner_id, owner_type, user_id)
+            conditions = [getattr(ScheduleBlock, OWNER_COLUMNS[owner_type]) == owner_id]
+        else:
+            conditions = [await _own_condition(db, ScheduleBlock, owner_type, user_id)]
+
+        # Фильтр по датам клиент задаёт в календарных днях, поэтому
+        # сравниваем с границами суток, а не с точным временем.
+        if date_from is not None:
+            conditions.append(
+                ScheduleBlock.end_at >= datetime.combine(
+                    date_from, time.min, tzinfo=timezone.utc
+                )
             )
+        if date_to is not None:
+            conditions.append(
+                ScheduleBlock.start_at <= datetime.combine(
+                    date_to, time.max, tzinfo=timezone.utc
+                )
+            )
+
+        where = and_(*conditions)
+
+        total = (
+            await db.execute(select(func.count(ScheduleBlock.id)).where(where))
+        ).scalar() or 0
+
+        result = await db.execute(
+            select(ScheduleBlock)
+            .where(where)
+            .order_by(ScheduleBlock.start_at)
+            .offset(skip)
+            .limit(limit)
         )
-
-        if date_from:
-            query = query.where(ScheduleBlock.start_datetime >= date_from)
-        
-        if date_to:
-            query = query.where(ScheduleBlock.end_datetime <= date_to)
-
-        # Проверка прав доступа
-        if user_id:
-            from app.models.user import User
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_accessible = False
-                
-                if owner_type == 'photographer':
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == owner_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    is_accessible = (photographer and str(photographer.user_id) == user_id)
-                    
-                elif owner_type == 'room':
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == owner_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        is_accessible = (studio and str(studio.user_id) == user_id)
-
-                if not is_accessible:
-                    return [], 0
-        
-        # Получение общего количества
-        count_query = select(func.count()).select_from(query.subquery())
-        total_result = await db.execute(count_query)
-        total = total_result.scalar() or 0
-
-        query = query.offset(skip).limit(limit)
-        result = await db.execute(query)
-        blocks = result.scalars().all()
-
-        return list(blocks), total
+        return list(result.scalars().all()), total
 
     @staticmethod
     async def delete_block(
-        db: AsyncSession, 
-        block_id: int, 
-        user_id: Optional[str] = None
-    ) -> bool:
-        """Удаляет блокировку слота.
-        
-        Args:
-            db: Асинхронная сессия базы данных
-            block_id: ID блокировки для удаления
-            user_id: ID текущего пользователя
-            
-        Returns:
-            True если успешно удалена
-        """
-        from app.models.sheduletemplate import ScheduleBlock
-        
-        result = await db.execute(
-            select(ScheduleBlock).where(ScheduleBlock.id == block_id)
-        )
-        block = result.scalar_one_or_none()
-
-        if not block:
-            raise ScheduleNotFoundError(
-                status_code=404,
-                detail=f"Блокировка слота с ID {block_id} не найдена"
-            )
-
-        # Проверка прав доступа
-        from app.models.user import User
-        
-        if user_id:
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            current_user = user_result.scalar_one_or_none()
-            
-            if current_user and current_user.role != 'admin':
-                is_owner = False
-                
-                if block.photographer_id:
-                    from app.models.photographerprofile import PhotographerProfile
-                    ph_result = await db.execute(
-                        select(PhotographerProfile).where(PhotographerProfile.id == block.photographer_id)
-                    )
-                    photographer = ph_result.scalar_one_or_none()
-                    if photographer and str(photographer.user_id) == user_id:
-                        is_owner = True
-                
-                elif block.room_id:
-                    from app.models.studioroom import StudioRoom
-                    room_result = await db.execute(
-                        select(StudioRoom).where(StudioRoom.id == block.room_id)
-                    )
-                    room = room_result.scalar_one_or_none()
-                    
-                    if room and current_user.role == 'studio':
-                        from app.models.studioprofile import StudioProfile
-                        studio_result = await db.execute(
-                            select(StudioProfile).where(StudioProfile.id == room.studio_id)
-                        )
-                        studio = studio_result.scalar_one_or_none()
-                        
-                        if studio and str(studio.user_id) == user_id:
-                            is_owner = True
-                
-                if not is_owner:
-                    raise ScheduleAccessDeniedError(
-                        status_code=403,
-                        detail="У вас нет прав на удаление этой блокировки"
-                    )
-
+        db: AsyncSession, block_id: int, user_id: Optional[str] = None
+    ) -> None:
+        """Снимает блокировку вместе с занятостью интервала."""
+        block = await ScheduleBlockService.get_block(db, block_id, user_id)
+        await release(db, kind="block", block_id=block.id)
         await db.delete(block)
-        await db.commit()
-
-        return True
-
-
-# ============================================================================
-# Initialize ScheduleBlock model if not exists
-# ============================================================================
-
-async def init_schedule_block_model(db: AsyncSession):
-    """Инициализирует модель ScheduleBlock если она ещё не создана.
-    
-    Эта функция должна быть вызвана один раз при инициализации БД.
-    
-    Args:
-        db: Асинхронная сессия базы данных
-    """
-    from app.models.base import Base
-    
-    # Проверяем, существует ли таблица schedule_blocks
-    from sqlalchemy import inspect
-    inspector = await db.run_sync(inspect)
-    
-    if 'schedule_blocks' not in inspector.get_table_names():
-        # Создаём модель ScheduleBlock динамически
-        from datetime import time as time_type
-        from sqlalchemy import TIME, CheckConstraint
-        
-        class ScheduleBlock(Base):
-            __tablename__ = "schedule_blocks"
-
-            id: int = 0  # Placeholder for type checker
-            photographer_id: Optional[int] = None
-            room_id: Optional[int] = None
-            start_datetime: date = None
-            end_datetime: date = None
-            reason: Optional[str] = None
-
-        # Создаём таблицу через MetaData
-        from sqlalchemy import MetaData
-        
-        metadata = Base.metadata
-        
-        # Создаём таблицу schedule_blocks если её нет
-        from sqlalchemy.schema import CreateTable
-        
-        await db.execute(CreateTable(ScheduleBlock.__table__, checkfirst=True))
-        
-        await db.commit()
+        await db.flush()

@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, Response
 from app.routers.auth import router as auth_router
 from app.routers.orders import router as orders_router
 # from app.routers.schedule import router as schedule_router
+from app.routers.schedule.router import router as schedule_router
 
 app = FastAPI(
     title="PicNest Marketplace API",
@@ -572,8 +573,7 @@ setup_prometheus_metrics(app)
 
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(orders_router, prefix="/api/v1/orders", tags=["Orders Management"])
-# app.include_router(schedule_router, prefix="/api/v1/schedule", tags=["Schedule Management"]) 
-# TODO: Подключить роутер расписания после создания модели ScheduleBlock в БД
+app.include_router(schedule_router, tags=["Schedule Management"])
 
 
 __all__ = ["app"]

@@ -15,16 +15,17 @@ RESTful API endpoints для модуля управления расписан�
 Автор: PicNest Backend Team
 """
 
-from datetime import date, time
+from datetime import date, datetime, time
 from typing import List, Optional
-from fastapi import APIRouter, Depends, status, Query
+from fastapi import APIRouter, Depends, Request, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.dependencies import get_current_user
+from app.core.rate_limiter import limiter
 from app.models.user import User
-from app.models.photographer import PhotographerProfile
-from app.models.room import StudioRoom
+from app.models.photographerprofile import PhotographerProfile
+from app.models.studioroom import StudioRoom
 from app.schemas.schedule.schemas import (
     # Template schemas
     ScheduleTemplateCreate,
@@ -165,6 +166,7 @@ def paginate_response(data: List, total: int, skip: int, limit: int):
     """
 )
 async def create_schedule_template(
+    request: Request,
     template_data: ScheduleTemplateCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -277,6 +279,7 @@ async def create_schedule_template(
     """
 )
 async def get_schedule_templates(
+    request: Request,
     owner_id: Optional[int] = Query(None, description="ID владельца"),
     owner_type: Optional[str] = Query(None, description="Тип владельца (photographer/room)"),
     day_of_week: Optional[int] = Query(None, ge=1, le=7, description="День недели (1-7)"),
@@ -336,6 +339,7 @@ async def get_schedule_templates(
     """
 )
 async def get_schedule_template(
+    request: Request,
     template_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -807,8 +811,8 @@ async def create_schedule_block(
             db=db,
             owner_id=block_data.owner_id,
             owner_type=block_data.owner_type.value,
-            start_datetime=block_data.start_datetime,
-            end_datetime=block_data.end_datetime,
+            start_at=block_data.start_at,
+            end_at=block_data.end_at,
             reason=block_data.reason,
             user_id=current_user.id if current_user else None,
         )
@@ -817,8 +821,8 @@ async def create_schedule_block(
             id=result.id,
             owner_id=result.photographer_id or result.room_id,
             owner_type="photographer" if result.photographer_id else "room",
-            start_datetime=result.start_datetime,
-            end_datetime=result.end_datetime,
+            start_at=result.start_at,
+            end_at=result.end_at,
             reason=result.reason,
         )
         
@@ -889,8 +893,8 @@ async def get_schedule_blocks(
                 id=b.id,
                 owner_id=b.photographer_id or b.room_id,
                 owner_type="photographer" if b.photographer_id else "room",
-                start_datetime=b.start_datetime,
-                end_datetime=b.end_datetime,
+                start_at=b.start_at,
+                end_at=b.end_at,
                 reason=b.reason,
             )
             for b in blocks
@@ -939,8 +943,8 @@ async def get_schedule_block(
             id=result.id,
             owner_id=result.photographer_id or result.room_id,
             owner_type="photographer" if result.photographer_id else "room",
-            start_datetime=result.start_datetime,
-            end_datetime=result.end_datetime,
+            start_at=result.start_at,
+            end_at=result.end_at,
             reason=result.reason,
         )
         
@@ -1064,44 +1068,4 @@ async def bulk_create_schedule_templates(
     return ScheduleTemplatesBulkResponse(
         created_count=created_count,
         failed_templates=failed_templates,
-    )
-
-
-# ============================================================================
-# Custom exception handlers for schedule module
-# ============================================================================
-
-@router.exception_handler(ScheduleValidationError)
-async def schedule_validation_exception_handler(request, exc: ScheduleValidationError):
-    """Обработчик ошибок валидации расписания."""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=str(exc.detail)
-    )
-
-
-@router.exception_handler(ScheduleConflictError)
-async def schedule_conflict_exception_handler(request, exc: ScheduleConflictError):
-    """Обработчик конфликтов при создании расписания."""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=str(exc.detail)
-    )
-
-
-@router.exception_handler(ScheduleAccessDeniedError)
-async def schedule_access_denied_exception_handler(request, exc: ScheduleAccessDeniedError):
-    """Обработчик ошибок доступа к расписанию."""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=str(exc.detail)
-    )
-
-
-@router.exception_handler(ScheduleNotFoundError)
-async def schedule_not_found_exception_handler(request, exc: ScheduleNotFoundError):
-    """Обработчик отсутствия записи в расписании."""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=str(exc.detail)
     )
