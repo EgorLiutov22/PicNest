@@ -263,6 +263,7 @@ class DeployConfig:
     min_disk_gb: int = 6  # ниже этого порога сборка образа может упасть
     frontend_dir: Optional[Path] = None  # локальный путь к проекту фронтенда
     frontend_web_root: str = "/var/www/picnest-front"
+    app_container: str = "picnest-app"  # container_name сервиса app
 
 
 def generate_secret(length: int = 48) -> str:
@@ -772,17 +773,30 @@ def step_health(r: Remote, cfg: DeployConfig) -> None:
 
     project = f"cd {shlex.quote(cfg.remote_dir)} && "
 
-    # Ждём /health через nginx (то есть проверяем весь путь, а не только app)
+    # После установки сертификата порт 80 больше не проксирует API: он отдаёт
+    # 301 на HTTPS для своего домена и 404 для остального. Поэтому проверяем
+    # по HTTPS с явным Host — так проходит весь путь nginx -> app, но не
+    # зависит от DNS и внешней сети.
+    # -f обязателен: без него curl считает успехом и 502 от nginx, пока app
+    # ещё не поднялся, и деплой отрапортует готовность раньше времени.
+    checks = []
+    if cfg.domain:
+        checks.append(f"curl -fksS --max-time 5 -H 'Host: {cfg.domain}' https://127.0.0.1/health")
+    checks.append("curl -fsS --max-time 5 http://127.0.0.1/health")
+    checks.append(
+        f"docker exec {shlex.quote(cfg.app_container)} "
+        "curl -fsS --max-time 5 http://localhost:8000/health"
+    )
+
     healthy = False
     for attempt in range(1, 21):
-        rc, out, _ = r.run(
-            "curl -fsS --max-time 5 http://127.0.0.1/health",
-            check=False,
-            quiet=True,
-        )
-        if rc == 0:
-            healthy = True
-            r.log.ok(f"/health отвечает: {out.strip()[:200]}")
+        for cmd in checks:
+            rc, out, _ = r.run(cmd, check=False, quiet=True)
+            if rc == 0:
+                healthy = True
+                r.log.ok(f"/health отвечает: {out.strip()[:200]}")
+                break
+        if healthy:
             break
         r.log.info(f"попытка {attempt}/20 — ещё не готово")
         if not cfg.dry_run:
@@ -1000,9 +1014,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"  {C.YELLOW}!{C.RESET} {msg}")
 
     if not cfg.dry_run and fail == 0:
-        print(f"\nПроверить изнутри сервера:  curl -s http://127.0.0.1/health")
-        print(f"Проверить снаружи:          curl -s http://{cfg.host}/health")
-        print(f"Документация API:           http://{cfg.host}/docs")
+        # Порт 80 проксирует API только до выпуска сертификата: certbot
+        # переводит его в 301 на HTTPS, поэтому рабочие ссылки — https.
+        if cfg.domain:
+            print(f"\nПроверить изнутри сервера:  curl -k -H 'Host: {cfg.domain}' https://127.0.0.1/health")
+            print(f"Проверить снаружи:          curl -s https://{cfg.domain}/health")
+            print(f"Документация API:           https://{cfg.domain}/docs")
+        else:
+            print(f"\nПроверить изнутри сервера:  curl -s http://127.0.0.1/health")
+            print(f"Проверить снаружи:          curl -s http://{cfg.host}/health")
+            print(f"Документация API:           http://{cfg.host}/docs")
         print(f"Логи:                       cd {cfg.remote_dir} && "
               f"docker compose -f docker-compose.prod.yml logs -f app")
 
