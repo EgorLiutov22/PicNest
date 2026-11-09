@@ -2,21 +2,18 @@
 Сервисы для модуля заказов PicNest.
 
 Этот модуль содержит бизнес-логику для:
-- Создания заказа с валидацией слотов и снапшотом данных
-- Проверки доступности временных интервалов (фотограф/зал)
+- Создания заказа с захватом слотов и снапшотом данных
 - Управления статусами заказов (подтверждение, отмена)
 - Расчета возврата средств при отмене
 
-Автор: PicNest Backend Team
-Дата: 2026-10-09
+Учёт занятости ресурсов — в app.services.schedule.occupancy.
 """
 
 from .services import (
     # Сервисы
     OrderService,
-    AvailabilityCheckerService,
     StatusManagerService,
-    
+
     # Исключения
     OrderValidationError,
     SlotConflictError,
@@ -25,10 +22,10 @@ from .services import (
     OrderNotFoundError,
     OrderForbiddenError,
 )
+from app.services.schedule.occupancy import SlotTakenError
 
 __all__ = [
     "OrderService",
-    "AvailabilityCheckerService",
     "StatusManagerService",
     "OrderValidationError",
     "SlotConflictError",
@@ -36,4 +33,5 @@ __all__ = [
     "StatusTransitionNotAllowed",
     "OrderNotFoundError",
     "OrderForbiddenError",
+    "SlotTakenError",
 ]

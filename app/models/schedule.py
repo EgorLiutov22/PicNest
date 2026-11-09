@@ -1,10 +1,10 @@
 from __future__ import annotations
-from datetime import date, time
+from datetime import date, datetime, time
 from typing import Optional, List
 
 
 from sqlalchemy import (
-    String, Text, Integer, DECIMAL, Boolean, Date, TIME, 
+    String, Text, Integer, DECIMAL, Boolean, Date, TIME,
     DateTime, ForeignKey, Enum as SQLEnum, CheckConstraint, Index
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -24,8 +24,10 @@ class ScheduleBlock(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     photographer_id: Mapped[Optional[int]] = mapped_column(ForeignKey("photographer_profiles.id", ondelete="CASCADE"))
     room_id: Mapped[Optional[int]] = mapped_column(ForeignKey("studio_rooms.id", ondelete="CASCADE"))
-    start_datetime: Mapped[date] = mapped_column(Date, nullable=False)
-    end_datetime: Mapped[date] = mapped_column(Date, nullable=False)
+    # Интервал в UTC: блокировка «с 14 до 16» невыразима датой,
+    # без времени начала и окончания.
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String(500))
 
     __table_args__ = (
@@ -33,7 +35,8 @@ class ScheduleBlock(Base):
             "(photographer_id IS NOT NULL AND room_id IS NULL) OR (photographer_id IS NULL AND room_id IS NOT NULL)",
             name="check_block_owner"
         ),
-        Index("idx_schedule_blocks_dates", "start_datetime", "end_datetime"),
+        CheckConstraint("end_at > start_at", name="check_block_range"),
+        Index("idx_schedule_blocks_dates", "start_at", "end_at"),
     )
 
     photographer: Mapped[Optional["PhotographerProfile"]] = relationship(back_populates="schedule_blocks")
@@ -61,7 +64,10 @@ class ScheduleTemplate(Base):
             name="check_template_owner"
         ),
         CheckConstraint("day_of_week BETWEEN 1 AND 7", name="check_day_of_week"),
-        Index("idx_schedule_templates_owner", "photographer_id", "room_id", unique=True),
+        CheckConstraint("end_time > start_time", name="check_template_time"),
+        # Уникальность задаётся частичными индексами в миграции:
+        # составной unique по (photographer_id, room_id) не ограничивал
+        # ничего — NULL в Postgres не равен другому NULL.
     )
 
     photographer: Mapped[Optional["PhotographerProfile"]] = relationship(back_populates="schedule_templates")
@@ -95,30 +101,3 @@ class ScheduleException(Base):
 
     photographer: Mapped[Optional["PhotographerProfile"]] = relationship(back_populates="schedule_exceptions")
     room: Mapped[Optional["StudioRoom"]] = relationship(back_populates="schedule_exceptions")
-
-
-# ============================================================================
-# Add relationships to existing models
-# ============================================================================
-
-async def add_schedule_relationships(db):
-    """Добавляет связи с расписанием к существующим моделям.
-    
-    Эта функция должна быть вызвана один раз при инициализации БД для добавления
-    обратной связи между PhotographerProfile/StudioRoom и таблицами расписания.
-    """
-    from sqlalchemy import text
-    
-    # Проверяем, существуют ли уже колонки schedule_blocks в photographer_profiles
-    try:
-        await db.execute(text("""
-            ALTER TABLE photographer_profiles 
-            ADD CONSTRAINT fk_photographer_schedule_blocks
-            FOREIGN KEY (id) REFERENCES schedule_blocks(photographer_id)
-            ON DELETE CASCADE;
-        """))
-    except Exception:
-        # Ожидаем ошибку если связь уже существует
-        pass
-    
-    await db.commit()

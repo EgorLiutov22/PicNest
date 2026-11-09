@@ -13,6 +13,7 @@ from app.models.ordertype import OrderType
 from app.models.payment import Payment
 from app.models.review import Review
 from app.models.schedule import ScheduleTemplate, ScheduleException, ScheduleBlock
+from app.models.resourceoccupancy import ResourceOccupancy
 
 __all__ = [
     "Base",
@@ -32,4 +33,5 @@ __all__ = [
     "ScheduleTemplate",
     "ScheduleException",
     "ScheduleBlock",
+    "ResourceOccupancy",
 ]

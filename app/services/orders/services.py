@@ -46,7 +46,11 @@ if TYPE_CHECKING:
     from app.schemas.orders.schemas import OrderCreate, OrderStatusEnum
 
 from app.schemas.orders.schemas import OrderTypeEnum
-from app.services.orders.availability import validate_items_availability
+from app.services.schedule.occupancy import (
+    SlotTakenError,
+    occupy_items,
+    release_order,
+)
 
 
 # ============================================================================
@@ -613,33 +617,29 @@ class OrderService:
         user_id: Optional[int] = None,
     ) -> Order:
         """Создает новый заказ с валидацией и снапшотом данных.
-        
+
         Процесс создания:
         1. Валидация данных заказа (Pydantic)
-        2. Проверка доступности всех слотов (AvailabilityCheckerService)
-        3. Формирование снапшота цен и условий на момент бронирования
+        2. Формирование снапшота цен и условий на момент бронирования
+        3. Захват слотов в resource_occupancy (накладки ловит constraint)
         4. Сохранение в БД с атомарностью
-        
+
         Args:
             db: Асинхронная сессия БД
             client_id: ID клиента (создателя заказа)
             order_data: Данные заказа из Pydantic модели
             user_id: ID пользователя (для аудита)
-            
+
         Returns:
             Созданный заказ
-            
+
         Raises:
-            SlotConflictError: Если слоты заняты
-            ScheduleBlockedException: Если слоты заблокированы
+            SlotTakenError: Если слоты заняты
             OrderValidationError: Ошибки валидации данных
         """
-        
-        # 1. Проверка доступности всех слотов через диспетчер по resource_type.
-        # Неизвестный тип ресурса даёт 400, конфликт — 409.
-        await validate_items_availability(db=db, items=order_data.items)
 
-        # 2. Получение данных для снапшота (цены, адреса, условия)
+        # 1. Снапшот: заодно проверяет, что ресурсы существуют, и отдаёт 400
+        # на неизвестный resource_type.
         # Ключ — индекс элемента: Pydantic-модели нехешируемы и не годятся
         # как ключи словаря.
         snapshot_data = await OrderService._collect_snapshot(
@@ -647,7 +647,7 @@ class OrderService:
             items_data=order_data.items,
         )
 
-        # 3. Расчет общей стоимости из снапшота
+        # 2. Расчет общей стоимости из снапшота
         total_price = Decimal("0.00")
         for idx in range(len(order_data.items)):
             total_price += snapshot_data[idx]["fixed_price"]
@@ -677,6 +677,7 @@ class OrderService:
         await db.flush()  # Получаем ID заказа
 
         # 5. Создание элементов заказа с фиксированными данными
+        created_items: List[OrderItem] = []
         for idx, item_data in enumerate(order_data.items):
             snapshot = snapshot_data[idx]
 
@@ -700,11 +701,24 @@ class OrderService:
             )
 
             db.add(new_item)
-        
+            created_items.append(new_item)
+
+        await db.flush()
+
+        # 6. Захват слотов. Накладку ловит exclusion constraint в БД, а не
+        # проверка перед вставкой: между проверкой и вставкой было окно,
+        # в которое влезал параллельный запрос.
+        await occupy_items(
+            db,
+            order_data.items,
+            order_item_ids=[item.id for item in created_items],
+            holds=new_order.status == OrderStatus.pending_payment,
+        )
+
         # Фиксируем заказ в БД
         await db.commit()
         await db.refresh(new_order)
-        
+
         return new_order
     
     @staticmethod

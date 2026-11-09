@@ -47,13 +47,12 @@ from app.schemas.orders.schemas import (
 from app.services.orders.services import (
     OrderService,
     StatusManagerService,
-    SlotConflictError,
-    ScheduleBlockedException,
     StatusTransitionNotAllowed,
     OrderNotFoundError,
     OrderForbiddenError,
     OrderValidationError,
 )
+from app.services.schedule.occupancy import SlotTakenError, release_order
 
 
 
@@ -323,23 +322,19 @@ async def create_order(
             created_at=new_order.created_at,
         )
         
-    except SlotConflictError as e:
+    except SlotTakenError as e:
         from app.core.exceptions import SlotAlreadyBookedException
-        # start_time/end_time у SlotConflictError нет — getattr со значением
-        # по умолчанию, иначе обработчик падал с AttributeError и клиент
-        # получал 500 вместо 409.
+        conflict = e.conflict or {}
         raise SlotAlreadyBookedException(
-            studio_id=getattr(e, "studio_id", None),
-            start_time=getattr(e, "start_time", None),
-            end_time=getattr(e, "end_time", None),
-            detail=f"Слот занят: {e.message}",
+            detail=(
+                f"Слот занят: {e.resource_type} (id={e.resource_id})"
+                + (
+                    f", занято {conflict['start']} — {conflict['end']}"
+                    if conflict.get("start") and conflict.get("end")
+                    else ""
+                )
+            ),
             error_code="SLOT_ALREADY_BOOKED",
-        )
-    except ScheduleBlockedException as e:
-        from app.core.exceptions import ConflictException
-        raise ConflictException(
-            detail=f"Время заблокировано в расписании: {e.message}",
-            error_code="SCHEDULE_BLOCKED",
         )
     except OrderValidationError as e:
         from app.core.exceptions import ValidationException
@@ -812,7 +807,11 @@ async def cancel_order(
             new_status=DBOrderStatus.cancelled,
             actor_type="client",  # Клиент отменяет
         )
-        
+
+        # Слот должен освободиться в той же транзакции, иначе отменённый
+        # заказ продолжит удерживать время.
+        await release_order(db, order.id)
+
         # Фиксируем изменения в БД
         await db.flush()
         await db.refresh(order)

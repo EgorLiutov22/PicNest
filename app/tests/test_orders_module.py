@@ -39,18 +39,12 @@ from app.schemas.orders.schemas import (
 # Импортируем сервисы
 from app.services.orders.services import (
     OrderService,
-    AvailabilityCheckerService,
     StatusManagerService,
-    SlotConflictError,
-    ScheduleBlockedException,
     StatusTransitionNotAllowed,
     OrderNotFoundError,
     OrderForbiddenError,
 )
-from app.services.orders.availability import (
-    AVAILABILITY_CHECKERS,
-    validate_items_availability,
-)
+from app.services.schedule.occupancy import SlotTakenError, occupy, occupy_items
 
 
 # ============================================================================
@@ -248,72 +242,108 @@ class TestOrderSchemaValidation:
 
 
 # ============================================================================
-# Tests для AvailabilityCheckerService
+# Tests для учёта занятости ресурсов
 # ============================================================================
 
-class TestAvailabilityCheckerService:
-    """Тесты диспетчера проверки доступности ресурсов."""
+class TestOccupancyService:
+    """Тесты сервиса занятости.
 
-    def test_dispatcher_has_known_types(self):
-        """В диспетчере есть чекеры для поддерживаемых типов ресурсов."""
-        assert "photographer" in AVAILABILITY_CHECKERS
-        assert "studio_room" in AVAILABILITY_CHECKERS
+    Пересечения ловит exclusion constraint в БД, поэтому здесь проверяется
+    не логика «свободно ли», а трансляция конфликта в SlotTakenError и
+    проверка аргументов.
+    """
 
     @pytest.mark.asyncio
-    async def test_available_slot_passes(self, mock_db_session):
-        """Свободный слот не вызывает исключений."""
-        with patch.dict(
-            AVAILABILITY_CHECKERS,
-            {"photographer": AsyncMock(return_value=None)},
-        ):
-            item = OrderItemCreate(
+    async def test_conflict_raises_slot_taken(self):
+        """Нарушение exclusion constraint превращается в SlotTakenError."""
+        from sqlalchemy.exc import IntegrityError
+
+        session = AsyncMock()
+        violation = IntegrityError("INSERT", {}, Exception())
+        violation.orig.pgcode = "23P01"
+        session.flush = AsyncMock(side_effect=violation)
+
+        with pytest.raises(SlotTakenError) as exc_info:
+            await occupy(
+                session,
                 resource_type="photographer",
                 resource_id=123,
                 start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                 end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+                kind="booking",
             )
 
-            # Не должно быть исключения
-            await validate_items_availability(db=mock_db_session, items=[item])
+        assert exc_info.value.resource_id == 123
+        assert exc_info.value.resource_type == "photographer"
 
     @pytest.mark.asyncio
-    async def test_conflict_raises_409(self, mock_db_session):
-        """Конфликт слота даёт HTTP 409."""
-        from fastapi import HTTPException
+    async def test_other_integrity_error_propagates(self):
+        """Прочие нарушения целостности не маскируются под занятость."""
+        from sqlalchemy.exc import IntegrityError
 
-        checker = AsyncMock(
-            side_effect=HTTPException(status_code=409, detail="Слот занят")
+        session = AsyncMock()
+        violation = IntegrityError("INSERT", {}, Exception())
+        violation.orig.pgcode = "23505"
+        session.flush = AsyncMock(side_effect=violation)
+
+        with pytest.raises(IntegrityError):
+            await occupy(
+                session,
+                resource_type="photographer",
+                resource_id=123,
+                start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
+                end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+                kind="booking",
+            )
+
+    @pytest.mark.asyncio
+    async def test_inverted_range_rejected(self):
+        """Интервал с концом раньше начала не доходит до БД."""
+        session = AsyncMock()
+
+        with pytest.raises(ValueError):
+            await occupy(
+                session,
+                resource_type="photographer",
+                resource_id=123,
+                start_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+                end_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
+                kind="booking",
+            )
+
+        session.flush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_naive_datetime_normalized_to_utc(self):
+        """Naive-время трактуется как UTC, иначе сдвиг на часовой пояс."""
+        session = AsyncMock()
+        session.flush = AsyncMock()
+
+        row = await occupy(
+            session,
+            resource_type="photographer",
+            resource_id=123,
+            start_time=datetime(2026, 10, 15, 10, 0),
+            end_time=datetime(2026, 10, 15, 14, 0),
+            kind="booking",
         )
-        with patch.dict(AVAILABILITY_CHECKERS, {"photographer": checker}):
-            item = OrderItemCreate(
-                resource_type="photographer",
-                resource_id=123,
-                start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
-                end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
-            )
 
-            with pytest.raises(HTTPException) as exc_info:
-                await validate_items_availability(db=mock_db_session, items=[item])
-
-            assert exc_info.value.status_code == 409
+        assert row.period.lower.utcoffset().total_seconds() == 0
+        assert row.period.lower.hour == 10
 
     @pytest.mark.asyncio
-    async def test_unknown_resource_type_raises_400(self, mock_db_session):
-        """Неизвестный resource_type даёт HTTP 400."""
-        from fastapi import HTTPException
-
+    async def test_ids_length_mismatch_rejected(self):
+        """Несовпадение числа позиций и id не должен молча урезаться zip'ом."""
+        session = AsyncMock()
         item = OrderItemCreate(
-            resource_type="lighting_rig",
-            resource_id=1,
+            resource_type="photographer",
+            resource_id=123,
             start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
             end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
         )
 
-        with pytest.raises(HTTPException) as exc_info:
-            await validate_items_availability(db=mock_db_session, items=[item])
-
-        assert exc_info.value.status_code == 400
-        assert "lighting_rig" in str(exc_info.value.detail)
+        with pytest.raises(ValueError):
+            await occupy_items(session, [item, item], order_item_ids=[1])
 
 
 # ============================================================================
@@ -414,7 +444,7 @@ class TestOrderService:
         mock_order.prepayment_amount = Decimal("5000.00")
         
         with patch(
-            "app.services.orders.services.validate_items_availability",
+            "app.services.orders.services.occupy_items",
             new=AsyncMock(return_value=None),
         ):
             with patch.object(
@@ -625,7 +655,7 @@ async def test_order_creation_performance(mock_db_session):
     
     # Выполняем создание заказа (mocked)
     with patch(
-        "app.services.orders.services.validate_items_availability",
+        "app.services.orders.services.occupy_items",
         new=AsyncMock(return_value=None),
     ):
         await OrderService.create_order(
