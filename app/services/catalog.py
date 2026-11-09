@@ -278,15 +278,38 @@ class CatalogService:
             busy=busy,
         )
 
+        # Ресурс без шаблона не имеет рабочих часов, но это не значит
+        # «занято». Отличаем эти случаи явным флагом: клиент иначе
+        # показывал бы «свободного времени нет» и бронирование было бы
+        # невозможно до настройки графика.
+        schedule_configured = await _has_schedule(
+            db, resource_type=resource_type, resource_id=resource_id
+        )
+
         return {
             "resource_type": resource_type,
             "resource_id": resource_id,
             "timezone": str(tz),
             "date_from": date_from,
             "date_to": date_to,
+            "schedule_configured": schedule_configured,
             "busy": busy,
             "free": free,
         }
+
+
+async def _has_schedule(
+    db: AsyncSession, *, resource_type: str, resource_id: int
+) -> bool:
+    column = (
+        ScheduleTemplate.photographer_id
+        if OWNER_TYPE_BY_RESOURCE[resource_type] == "photographer"
+        else ScheduleTemplate.room_id
+    )
+    result = await db.execute(
+        select(ScheduleTemplate.id).where(column == resource_id).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def _ensure_resource_exists(

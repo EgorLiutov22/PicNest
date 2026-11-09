@@ -102,5 +102,8 @@ class AvailabilityResponse(CatalogModel):
     timezone: str
     date_from: date
     date_to: date
+    # False означает «рабочие часы не настроены», а не «всё занято»:
+    # без этого поля клиент не отличает одно от другого.
+    schedule_configured: bool = True
     busy: List[BusyInterval] = Field(default_factory=list)
     free: List[FreeInterval] = Field(default_factory=list)
