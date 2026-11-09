@@ -29,6 +29,7 @@ from app.routers.auth import router as auth_router
 from app.routers.orders import router as orders_router
 # from app.routers.schedule import router as schedule_router
 from app.routers.schedule.router import router as schedule_router
+from app.routers.catalog.router import router as catalog_router
 
 app = FastAPI(
     title="PicNest Marketplace API",
@@ -574,6 +575,7 @@ setup_prometheus_metrics(app)
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(orders_router, prefix="/api/v1/orders", tags=["Orders Management"])
 app.include_router(schedule_router, tags=["Schedule Management"])
+app.include_router(catalog_router, prefix="/api/v1", tags=["Catalog"])
 
 
 __all__ = ["app"]
