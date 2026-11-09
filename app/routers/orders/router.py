@@ -27,6 +27,7 @@ from app.core.exceptions import AppException
 from app.models.user import User
 from app.models.orderstatus import OrderStatus as DBOrderStatus
 from app.models.ordertype import OrderType as DBOrderType
+from app.models.studioroom import StudioRoom
 from app.schemas.orders.schemas import (
     OrderCreate,
     OrderCreateResponse,
@@ -105,8 +106,12 @@ def order_to_detail_response(order) -> OrderResponse:
 
         item_response = {
             "id": item.id,
+            "resource_type": item.resource_type,
+            "resource_id": item.resource_id,
+            "service_id": item.service_id,
+            # Детали ресурса пока читаются из старых колонок — они
+            # дублируются при создании заказа.
             "photographer_id": item.photographer_id,
-            "photographer_service_id": item.photographer_service_id,
             "studio_room_id": item.studio_room_id,
             "start_time": item.start_time,
             "end_time": item.end_time,
@@ -275,38 +280,30 @@ async def create_order(
         time_slots.append({
             "start": start_dt,
             "end": end_dt,
-            "photographer_id": item.photographer_id,
-            "studio_room_id": item.studio_room_id if hasattr(item, 'studio_room_id') else None,
+            "resource_type": item.resource_type,
+            "resource_id": item.resource_id,
             "item_idx": idx,
         })
     
     # Проверка 2: Для комбинированных заказов (photographer + studio) — проверка что фотограф и зал в одно время
-    if order_data.order_type == "combined" or len(order_data.items) > 1:
+    if len(order_data.items) > 1:
         from collections import defaultdict
         slots_by_time = defaultdict(list)
-        
+
         for slot in time_slots:
             # Группируем по времени (с точностью до минуты)
             time_key = f"{slot['start'].strftime('%Y-%m-%d %H:%M')}"
             slots_by_time[time_key].append(slot)
-        
-        # Проверяем что в одно время нет конфликтов
+
+        # Проверяем что в одно время одна и та же пара ресурс+id не встречается дважды
         for time_key, slots in slots_by_time.items():
             if len(slots) > 1:
-                # Проверка что фотографы не пересекаются
-                photographers = [s['photographer_id'] for s in slots]
-                studios = [s['studio_room_id'] for s in slots if s['studio_room_id']]
-                
-                if len(set(photographers)) < len(photographers):
+                resources = [(s['resource_type'], s['resource_id']) for s in slots]
+
+                if len(set(resources)) < len(resources):
                     raise ValidationException(
-                        detail=f"В одно время ({time_key}) один фотограф назначен на несколько слотов",
-                        error_code="PHOTOGRAPHER_DOUBLE_BOOKING",
-                    )
-                
-                if len(set(studios)) < len([s for s in studios if s]):
-                    raise ValidationException(
-                        detail=f"В одно время ({time_key}) один зал назначен на несколько слотов",
-                        error_code="STUDIO_ROOM_DOUBLE_BOOKING",
+                        detail=f"В одно время ({time_key}) один и тот же ресурс указан дважды",
+                        error_code="RESOURCE_DOUBLE_BOOKING",
                     )
     
     try:
@@ -585,19 +582,30 @@ async def confirm_order(
             )).scalars().all()
         )
 
+        # Залу принадлежит студия, поэтому сопоставляем room -> studio,
+        # чтобы проверить владение по универсальному resource_id.
+        room_ids: set[int] = set()
+        if studio_ids:
+            room_ids = set(
+                (await db.execute(
+                    _select(StudioRoom.id).where(StudioRoom.studio_id.in_(studio_ids))
+                )).scalars().all()
+            )
+
         is_performer = False
         performer_type = None
 
         for item in order.items:
-            if item.photographer_id in photographer_ids:
-                is_performer = True
-                performer_type = "photographer"
-                break
-
-            if item.studio_room and item.studio_room.studio_id in studio_ids:
-                is_performer = True
-                performer_type = "studio_representative"
-                break
+            if item.resource_type == "photographer":
+                if item.resource_id in photographer_ids:
+                    is_performer = True
+                    performer_type = "photographer"
+                    break
+            elif item.resource_type == "studio_room":
+                if item.resource_id in room_ids:
+                    is_performer = True
+                    performer_type = "studio_representative"
+                    break
         
         if not is_performer:
             raise ForbiddenException(

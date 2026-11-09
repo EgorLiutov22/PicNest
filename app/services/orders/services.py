@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from app.schemas.orders.schemas import OrderCreate, OrderStatusEnum
 
 from app.schemas.orders.schemas import OrderTypeEnum
+from app.services.orders.availability import validate_items_availability
 
 
 # ============================================================================
@@ -229,26 +230,31 @@ class AvailabilityCheckerService:
             Order.status != OrderStatus.cancelled,
         )
 
+        # Старые аргументы переводятся в универсальный указатель: фильтр
+        # по resource_type/resource_id работает и для типов, у которых
+        # нет отдельной колонки.
         if photographer_id:
-            query = select(OrderItem.id).join(Order, OrderItem.order_id == Order.id).where(
-                and_(
-                    overlap_condition,
-                    OrderItem.photographer_id == photographer_id,
-                ),
-            )
+            resource_type, resource_id = "photographer", photographer_id
         elif studio_room_id:
-            query = select(OrderItem.id).join(Order, OrderItem.order_id == Order.id).where(
-                and_(
-                    overlap_condition,
-                    OrderItem.studio_room_id == studio_room_id,
-                ),
-            )
+            resource_type, resource_id = "studio_room", studio_room_id
         else:
             return None
-        
+
+        query = (
+            select(OrderItem.id)
+            .join(Order, OrderItem.order_id == Order.id)
+            .where(
+                and_(
+                    overlap_condition,
+                    OrderItem.resource_type == resource_type,
+                    OrderItem.resource_id == resource_id,
+                ),
+            )
+        )
+
         # Исключаем текущий заказ если нужно
         if exclude_order_id:
-            query = query.where(OrderItem.id != exclude_order_id)
+            query = query.where(Order.id != exclude_order_id)
         
         # Выполняем запрос
         result = await db.execute(query)
@@ -568,6 +574,24 @@ async def _profiles_of_user(db: AsyncSession, user_id: str, kind: str) -> List[A
     return list(result.scalars().all())
 
 
+def _item_belongs_to_performer(
+    item: OrderItem,
+    photographer_ids: set[int],
+    studio_room_ids: set[int],
+) -> bool:
+    """Принадлежит ли позиция заказа исполнителю.
+
+    Тип ресурса берётся из универсального указателя. Новый тип ресурса,
+    добавленный в AVAILABILITY_CHECKERS, сюда тоже нужно добавить ветку —
+    иначе его исполнитель не увидит свои заказы.
+    """
+    if item.resource_type == "photographer":
+        return item.resource_id in photographer_ids
+    if item.resource_type == "studio_room":
+        return item.resource_id in studio_room_ids
+    return False
+
+
 # ============================================================================
 # OrderService
 # ============================================================================
@@ -611,16 +635,10 @@ class OrderService:
             OrderValidationError: Ошибки валидации данных
         """
         
-        # 1. Проверка доступности всех слотов
-        for item_data in order_data.items:
-            await AvailabilityCheckerService.check_slot_availability(
-                db=db,
-                photographer_id=item_data.photographer_id,
-                studio_room_id=item_data.studio_room_id,
-                start_time=item_data.start_time,
-                end_time=item_data.end_time,
-            )
-        
+        # 1. Проверка доступности всех слотов через диспетчер по resource_type.
+        # Неизвестный тип ресурса даёт 400, конфликт — 409.
+        await validate_items_availability(db=db, items=order_data.items)
+
         # 2. Получение данных для снапшота (цены, адреса, условия)
         # Ключ — индекс элемента: Pydantic-модели нехешируемы и не годятся
         # как ключи словаря.
@@ -641,10 +659,14 @@ class OrderService:
                 f"Предоплата ({prepayment}) не может превышать сумму заказа ({total_price})"
             )
 
-        # 4. Создание заказа
+        # 4. Создание заказа.
+        # Тип выводится из состава позиций одним правилом — в схеме
+        # (derived_order_type). Клиентское значение игнорируется.
+        order_type = OrderType(order_data.derived_order_type.value)
+
         new_order = Order(
             client_id=client_id,
-            order_type=order_data.order_type,
+            order_type=order_type,
             status=OrderStatus.pending_payment,
             total_price=total_price,
             prepayment_amount=prepayment,
@@ -658,16 +680,23 @@ class OrderService:
         for idx, item_data in enumerate(order_data.items):
             snapshot = snapshot_data[idx]
 
+            # Пишем и новые универсальные поля, и старые колонки: пока
+            # чтение идёт по старым, заказ должен остаться читаемым.
+            legacy_fields = OrderService._legacy_resource_fields(
+                item_data.resource_type, item_data.resource_id
+            )
+
             new_item = OrderItem(
                 order_id=new_order.id,
-                photographer_id=item_data.photographer_id,
-                photographer_service_id=item_data.photographer_service_id,
-                studio_room_id=item_data.studio_room_id,
+                resource_type=item_data.resource_type,
+                resource_id=item_data.resource_id,
+                service_id=item_data.service_id,
                 start_time=item_data.start_time,
                 end_time=item_data.end_time,
                 fixed_price=snapshot["fixed_price"],
                 # Колонка Text: словарь сериализуем в JSON-строку
                 fixed_conditions=json.dumps(snapshot["conditions"], ensure_ascii=False),
+                **legacy_fields,
             )
 
             db.add(new_item)
@@ -701,25 +730,26 @@ class OrderService:
         snapshot: Dict[int, Dict[str, Any]] = {}
 
         for idx, item in enumerate(items_data):
-            # Получаем данные из БД
-            if item.photographer_id:
+            # Тип ресурса определяет, откуда брать цену и условия.
+            # Новый тип добавляется веткой здесь и записью в AVAILABILITY_CHECKERS.
+            if item.resource_type == "photographer":
                 # Фотограф: цена берётся из выбранной услуги
                 result = await db.execute(
                     select(PhotographerProfile, PhotographerService).where(
-                        PhotographerProfile.id == item.photographer_id,
+                        PhotographerProfile.id == item.resource_id,
                     ).join(
                         PhotographerService,
-                        PhotographerService.photographer_id == item.photographer_id,
+                        PhotographerService.photographer_id == item.resource_id,
                         isouter=True,
                     ).where(
-                        PhotographerService.id == item.photographer_service_id,
+                        PhotographerService.id == item.service_id,
                     )
                 )
                 row = result.first()
 
                 if not row:
                     raise OrderValidationError(
-                        f"Фотограф с ID {item.photographer_id} не найден"
+                        f"Фотограф с ID {item.resource_id} не найден"
                     )
 
                 profile, photographer_service = row
@@ -727,17 +757,18 @@ class OrderService:
                 snapshot[idx] = {
                     "fixed_price": photographer_service.price if photographer_service else Decimal("0.00"),
                     "conditions": {
+                        "resource_type": item.resource_type,
                         "photographer_name": profile.display_name,
                         "service_title": photographer_service.title if photographer_service else None,
                         "terms_cancellation": "По соглашению сторон",
                     },
                 }
 
-            elif item.studio_room_id:
+            elif item.resource_type == "studio_room":
                 # Зал студии: price_per_hour умножается на длительность аренды
                 result = await db.execute(
                     select(StudioRoom, StudioProfile).where(
-                        StudioRoom.id == item.studio_room_id,
+                        StudioRoom.id == item.resource_id,
                     ).join(
                         StudioProfile,
                         StudioProfile.id == StudioRoom.studio_id,
@@ -747,7 +778,7 @@ class OrderService:
 
                 if not row:
                     raise OrderValidationError(
-                        f"Зал с ID {item.studio_room_id} не найден"
+                        f"Зал с ID {item.resource_id} не найден"
                     )
 
                 room, studio = row
@@ -760,6 +791,7 @@ class OrderService:
                 snapshot[idx] = {
                     "fixed_price": price,
                     "conditions": {
+                        "resource_type": item.resource_type,
                         "room_name": room.name,
                         "studio_title": studio.title,
                         "address": studio.address,
@@ -769,7 +801,27 @@ class OrderService:
                     },
                 }
 
+            else:
+                raise OrderValidationError(
+                    f"Неизвестный тип ресурса: {item.resource_type}"
+                )
+
         return snapshot
+
+    @staticmethod
+    def _legacy_resource_fields(resource_type: str, resource_id: int) -> Dict[str, Any]:
+        """Дублирует ресурс в старые колонки для обратной совместимости.
+
+        Пока чтение заказов идёт по photographer_id/studio_room_id,
+        пишем туда же, чтобы существующие запросы продолжали работать.
+        После переноса чтения на resource_type/resource_id этот метод
+        удаляется вместе с колонками.
+        """
+        if resource_type == "photographer":
+            return {"photographer_id": resource_id}
+        if resource_type == "studio_room":
+            return {"studio_room_id": resource_id}
+        return {}
     
     @staticmethod
     async def get_orders(
@@ -811,24 +863,34 @@ class OrderService:
             query = query.where(Order.client_id == current_user.id)
             total_query = total_query.where(Order.client_id == current_user.id)
         else:
-            # Исполнитель видит свои входящие брони.
-            # OrderItem.photographer_id — это photographer_profiles.id (int),
-            # а current_user.id — UUID пользователя. Сравнивать их напрямую
-            # бессмысленно, поэтому подзапросом берём id профилей пользователя.
+            # Исполнитель видит свои входящие брони. Права определяем по
+            # resource_type/resource_id, а не по старым колонкам: новый тип
+            # ресурса (визажист, осветитель) не имеет своей колонки, и
+            # фильтр по старым полям его бы не увидел.
+            # id профиля — int, current_user.id — UUID, поэтому сначала
+            # подзапросом достаём профили пользователя.
             photographer_profile_ids = select(PhotographerProfile.id).where(
                 PhotographerProfile.user_id == current_user.id
             )
-            studio_profile_ids = select(StudioProfile.id).where(
-            StudioProfile.user_id == current_user.id
+            studio_room_ids = select(StudioRoom.id).where(
+                StudioRoom.studio_id.in_(
+                    select(StudioProfile.id).where(
+                        StudioProfile.user_id == current_user.id
+                    )
+                )
             )
 
             performer_condition = or_(
                 Order.items.any(
-                    OrderItem.photographer_id.in_(photographer_profile_ids)
+                    and_(
+                        OrderItem.resource_type == "photographer",
+                        OrderItem.resource_id.in_(photographer_profile_ids),
+                    )
                 ),
                 Order.items.any(
-                    OrderItem.studio_room.has(
-                        StudioRoom.studio_id.in_(studio_profile_ids)
+                    and_(
+                        OrderItem.resource_type == "studio_room",
+                        OrderItem.resource_id.in_(studio_room_ids),
                     )
                 ),
             )
@@ -916,14 +978,23 @@ class OrderService:
                 s.id for s in await _profiles_of_user(db, current_user.id, "studio")
             }
 
-            has_access = False
-            for item in order.items:
-                if item.photographer_id in performer_photographer_ids:
-                    has_access = True
-                    break
-                if item.studio_room and item.studio_room.studio_id in performer_studio_ids:
-                    has_access = True
-                    break
+            # Дальше проверяем владение ресурсом по универсальному указателю.
+            # Залу принадлежит студия, поэтому нужно сопоставить room -> studio.
+            performer_room_ids: set[int] = set()
+            if performer_studio_ids:
+                room_result = await db.execute(
+                    select(StudioRoom.id).where(
+                        StudioRoom.studio_id.in_(performer_studio_ids)
+                    )
+                )
+                performer_room_ids = set(room_result.scalars().all())
+
+            has_access = any(
+                _item_belongs_to_performer(
+                    item, performer_photographer_ids, performer_room_ids
+                )
+                for item in order.items
+            )
 
             if not has_access:
                 raise OrderForbiddenError(

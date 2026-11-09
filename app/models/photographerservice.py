@@ -22,4 +22,9 @@ class PhotographerService(Base):
     price: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
 
     photographer: Mapped["PhotographerProfile"] = relationship(back_populates="services")
-    order_items: Mapped[List["OrderItem"]] = relationship(back_populates="photographer_service")
+    # foreign_keys обязателен: у OrderItem две связи с этой таблицей
+    # (photographer_service_id и service_id).
+    order_items: Mapped[List["OrderItem"]] = relationship(
+        back_populates="photographer_service",
+        foreign_keys="OrderItem.photographer_service_id",
+    )

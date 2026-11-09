@@ -111,10 +111,14 @@ ORDER_STATUS_TRANSITIONS: List[OrderStatusTransitionRule] = [
 
 class OrderBase(BaseModel):
     """Базовая модель заказа без обязательных полей."""
-    
-    order_type: OrderTypeEnum = Field(
-        ...,
-        description="Тип бронирования",
+
+    order_type: Optional[OrderTypeEnum] = Field(
+        None,
+        deprecated=True,
+        description=(
+            "Устарело и игнорируется: тип заказа выводится сервером из состава "
+            "items. Поле оставлено, чтобы старые клиенты не получали ошибку."
+        ),
         examples=["photographer_only"]
     )
 
@@ -125,41 +129,46 @@ class OrderBase(BaseModel):
 
 class OrderItemCreate(BaseModel):
     """Схема для создания элемента заказа.
-    
-    Каждый элемент заказа представляет собой бронирование конкретного
-    ресурса (фотографа или зала студии) на определенный временной интервал.
+
+    Один элемент — бронирование одного ресурса (фотографа, зала студии,
+    а в будущем и другого специалиста) на указанный интервал.
+
+    Ресурс задаётся парой resource_type + resource_id, поэтому добавление
+    нового типа специалиста не требует изменения схемы.
     """
-    
-    photographer_id: Optional[int] = Field(
+
+    resource_type: str = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Тип ресурса: photographer, studio_room и т.д.",
+        examples=["photographer", "studio_room"]
+    )
+
+    resource_id: int = Field(
+        ...,
+        ge=1,
+        description="ID ресурса в таблице, соответствующей resource_type"
+    )
+
+    service_id: Optional[int] = Field(
         None,
         ge=1,
-        description="ID фотографа (обязательно для photographer_only и combined)"
+        description="ID услуги ресурса (для фотографа, визажиста и т.п.)"
     )
-    
-    photographer_service_id: Optional[int] = Field(
-        None,
-        ge=1,
-        description="ID услуги фотографа (для photographer_only и combined)"
-    )
-    
-    studio_room_id: Optional[int] = Field(
-        None,
-        ge=1,
-        description="ID зала студии (обязательно для studio_only и combined)"
-    )
-    
+
     start_time: datetime = Field(
         ...,
         description="Время начала бронирования",
         examples=["2026-10-15T10:00:00+03:00"]
     )
-    
+
     end_time: datetime = Field(
         ...,
         description="Время окончания бронирования",
         examples=["2026-10-15T14:00:00+03:00"]
     )
-    
+
     @field_validator('start_time', 'end_time')
     @classmethod
     def validate_datetime_timezone(cls, v: datetime) -> datetime:
@@ -167,35 +176,30 @@ class OrderItemCreate(BaseModel):
         if v.tzinfo is None:
             raise ValueError('datetime должен содержать timezone')
         return v
-    
+
+    @field_validator('resource_type')
+    @classmethod
+    def validate_resource_type(cls, v: str) -> str:
+        """Приводит тип ресурса к нижнему регистру без пробелов по краям."""
+        normalized = v.strip().lower()
+        if not normalized:
+            raise ValueError('resource_type не может быть пустым')
+        return normalized
+
     @model_validator(mode='after')
     def validate_time_range(self) -> 'OrderItemCreate':
         """Валидирует временной интервал."""
         if self.end_time <= self.start_time:
             raise ValueError('end_time должно быть строго больше start_time')
-        
-        # Проверка длительности (минимум 1 час для фотографа, минимум min_rent_hours для зала)
+
+        # Минимальная длительность в час — правило для специалистов с
+        # почасовой работой. Для залов минимум задаётся в min_rent_hours
+        # и проверяется при расчёте цены.
         duration_minutes = (self.end_time - self.start_time).total_seconds() / 60
-        
-        if self.photographer_id:
-            if duration_minutes < 60:
-                raise ValueError('Минимальная длительность бронирования фотографа — 1 час')
-        
-        return self
-    
-    @model_validator(mode='after')
-    def validate_item_owner(self) -> 'OrderItemCreate':
-        """Проверяет что указан именно один из владельцев (фотограф или зал)."""
-        has_photographer = self.photographer_id is not None
-        has_studio_room = self.studio_room_id is not None
-        
-        if not has_photographer and not has_studio_room:
-            raise ValueError('Должен быть указан фотограф или зал студии')
-        
-        if has_photographer and has_studio_room:
-            # Для combined типа оба должны быть указаны - это проверяется в основном заказe
-            pass
-        
+
+        if self.resource_type != "studio_room" and duration_minutes < 60:
+            raise ValueError('Минимальная длительность бронирования — 1 час')
+
         return self
 
 
@@ -215,16 +219,20 @@ class OrderCreate(BaseModel):
     зафиксированы на момент создания заказа (снапшот).
     """
     
-    order_type: OrderTypeEnum = Field(
-        ...,
-        description="Тип бронирования",
-        examples=["photographer_only"]
+    order_type: Optional[OrderTypeEnum] = Field(
+        None,
+        deprecated=True,
+        description=(
+            "Устарело и игнорируется: тип заказа выводится сервером из состава items. "
+            "Поле оставлено, чтобы старые клиенты не получали ошибку."
+        ),
+        examples=["photographer_only"],
     )
     
     items: List[OrderItemCreate] = Field(
         ...,
         min_items=1,
-        max_items=2,  # Максимум 2 элемента (фотограф + зал для combined)
+        max_items=5,  # до 5 ресурсов в одном заказе (фотограф, визажист, зал...)
         description="Элементы заказа (бронирования ресурсов)"
     )
     
@@ -249,31 +257,24 @@ class OrderCreate(BaseModel):
             raise ValueError('Предоплата не может быть отрицательной')
         return v
     
-    @model_validator(mode='after')
-    def validate_order_type_consistency(self) -> 'OrderCreate':
-        """Проверяет соответствие типа заказа элементам."""
-        has_photographer = any(item.photographer_id is not None for item in self.items)
-        has_studio_room = any(item.studio_room_id is not None for item in self.items)
-        
-        if self.order_type == OrderTypeEnum.photographer_only:
-            if not has_photographer or has_studio_room:
-                raise ValueError(
-                    'Для типа photographer_only должен быть указан только фотограф'
-                )
-        
-        elif self.order_type == OrderTypeEnum.studio_only:
-            if not has_studio_room or has_photographer:
-                raise ValueError(
-                    'Для типа studio_only должен быть указан только зал студии'
-                )
-        
-        elif self.order_type == OrderTypeEnum.combined:
-            if not (has_photographer and has_studio_room):
-                raise ValueError(
-                    'Для типа combined должны быть указаны и фотограф и зал студии'
-                )
-        
-        return self
+    @property
+    def derived_order_type(self) -> 'OrderTypeEnum':
+        """Тип заказа, выведенный из состава позиций.
+
+        Один тип ресурса — соответствующий *_only, специалист вместе с
+        залом — combined. Несколько разных специалистов без зала тоже
+        считаются combined, если среди них больше одного вида.
+        """
+        types = {item.resource_type for item in self.items}
+        has_studio_room = "studio_room" in types
+
+        if has_studio_room and len(types) > 1:
+            return OrderTypeEnum.combined
+        if has_studio_room:
+            return OrderTypeEnum.studio_only
+        if len(types) > 1:
+            return OrderTypeEnum.combined
+        return OrderTypeEnum.photographer_only
     
     @model_validator(mode='after')
     def validate_all_items_same_datetime_range(self) -> 'OrderCreate':
@@ -330,16 +331,20 @@ class StudioRoomInfo(BaseModel):
 
 class OrderItemResponse(BaseModel):
     """Детальная информация об элементе заказа (бронировании)."""
-    
+
     id: int = Field(..., description="ID элемента заказа")
+
+    resource_type: Optional[str] = Field(None, description="Тип ресурса")
+    resource_id: Optional[int] = Field(None, description="ID ресурса")
+    service_id: Optional[int] = Field(None, description="ID услуги ресурса")
+
+    # Детали ресурса заполняются, пока данные берутся из старых колонок
     photographer_id: Optional[int] = Field(None, description="ID фотографа")
     photographer_info: Optional[PhotographerInfo] = None
-    
-    photographer_service_id: Optional[int] = Field(None, description="ID услуги")
-    
+
     studio_room_id: Optional[int] = Field(None, description="ID зала студии")
     studio_room_info: Optional[StudioRoomInfo] = None
-    
+
     start_time: datetime = Field(..., description="Время начала бронирования")
     end_time: datetime = Field(..., description="Время окончания бронирования")
     fixed_price: Decimal = Field(..., description="Фиксированная цена (снапшот)")
@@ -511,10 +516,10 @@ class OrderCancelResponse(BaseModel):
 
 class SlotConflictErrorDetail(BaseModel):
     """Детали конфликта временных слотов."""
-    
+
     order_item_id: Optional[int] = Field(None, description="ID элемента заказа")
-    photographer_id: Optional[int] = Field(None, description="ID фотографа")
-    studio_room_id: Optional[int] = Field(None, description="ID зала студии")
+    resource_type: Optional[str] = Field(None, description="Тип ресурса")
+    resource_id: Optional[int] = Field(None, description="ID ресурса")
     start_time: datetime = Field(..., description="Время начала конфликта")
     end_time: datetime = Field(..., description="Время окончания конфликта")
     conflicting_order_id: int = Field(..., description="ID конфликтующего заказа")

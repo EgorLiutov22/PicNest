@@ -15,6 +15,7 @@ Unit tests для модуля заказов PicNest Marketplace.
 """
 
 import pytest
+from pydantic import ValidationError
 from datetime import date, datetime, time as dt_time
 from decimal import Decimal
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -46,6 +47,10 @@ from app.services.orders.services import (
     OrderNotFoundError,
     OrderForbiddenError,
 )
+from app.services.orders.availability import (
+    AVAILABILITY_CHECKERS,
+    validate_items_availability,
+)
 
 
 # ============================================================================
@@ -68,8 +73,9 @@ def sample_order_create_data():
         order_type=OrderTypeEnum.photographer_only,
         items=[
             OrderItemCreate(
-                photographer_id=123,
-                photographer_service_id=456,
+                resource_type="photographer",
+                resource_id=123,
+                service_id=456,
                 start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                 end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
             )
@@ -135,85 +141,110 @@ class TestOrderSchemaValidation:
         assert len(sample_order_create_data.items) == 1
         
         item = sample_order_create_data.items[0]
-        assert item.photographer_id == 123
+        assert item.resource_type == "photographer"
+        assert item.resource_id == 123
+        assert item.service_id == 456
         assert item.start_time.tzinfo is not None
         assert item.end_time > item.start_time
     
     def test_invalid_time_range_end_before_start(self):
         """Проверяет что заказ с end_time < start_time отклоняется."""
-        
+
         with pytest.raises(ValueError) as exc_info:
             OrderItemCreate(
-                photographer_id=123,
+                resource_type="photographer",
+                resource_id=123,
                 start_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
                 end_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
             )
-        
+
         assert "end_time должно быть строго больше start_time" in str(exc_info.value)
-    
-    def test_invalid_order_type_photographer_only(self):
-        """Проверяет что photographer_only не может содержать зал студии."""
-        
-        invalid_data = OrderCreate(
-            order_type=OrderTypeEnum.photographer_only,
+
+    def test_order_type_is_derived_not_validated(self):
+        """order_type от клиента игнорируется: тип считается из состава позиций."""
+
+        data = OrderCreate(
+            order_type=OrderTypeEnum.photographer_only,  # намеренно неверный
             items=[
                 OrderItemCreate(
-                    photographer_id=123,
-                    studio_room_id=789,  # Не должно быть для photographer_only
+                    resource_type="studio_room",
+                    resource_id=789,
                     start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                     end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
                 )
             ],
             prepayment_amount=Decimal("5000.00"),
         )
-        
-        with pytest.raises(ValueError) as exc_info:
-            invalid_data.model_validate(invalid_data, strict=True)
-        
-        assert "Для типа photographer_only должен быть указан только фотограф" in str(exc_info.value)
-    
+
+        # Клиентское значение сохранено как есть, но сервер использует вывод
+        assert data.order_type == OrderTypeEnum.photographer_only
+        assert data.derived_order_type == OrderTypeEnum.studio_only
+
     def test_valid_combined_order(self):
         """Проверяет корректное создание комбинированного заказа."""
-        
+
         valid_data = OrderCreate(
-            order_type=OrderTypeEnum.combined,
             items=[
                 OrderItemCreate(
-                    photographer_id=123,
+                    resource_type="photographer",
+                    resource_id=123,
                     start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                     end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
                 ),
                 OrderItemCreate(
-                    studio_room_id=789,
+                    resource_type="studio_room",
+                    resource_id=789,
                     start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                     end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
                 ),
             ],
             prepayment_amount=Decimal("7000.00"),
         )
-        
-        assert valid_data.order_type == OrderTypeEnum.combined
+
+        assert valid_data.order_type is None
+        assert valid_data.derived_order_type == OrderTypeEnum.combined
         assert len(valid_data.items) == 2
-    
-    def test_invalid_combination_missing_photographer(self):
-        """Проверяет что combined требует и фотографа и зал."""
-        
-        invalid_data = OrderCreate(
-            order_type=OrderTypeEnum.combined,
+
+    def test_combined_derived_from_specialist_plus_room(self):
+        """Специалист + зал без указания order_type даёт combined."""
+
+        # Только специалисты дают photographer_only
+        only_specialists = OrderCreate(
             items=[
                 OrderItemCreate(
-                    photographer_id=123,  # Только фотограф
+                    resource_type="photographer",
+                    resource_id=123,
                     start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                     end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
                 )
             ],
             prepayment_amount=Decimal("5000.00"),
         )
-        
-        with pytest.raises(ValueError) as exc_info:
-            invalid_data.model_validate(invalid_data, strict=True)
-        
-        assert "Для типа combined должны быть указаны и фотограф и зал студии" in str(exc_info.value)
+        assert only_specialists.derived_order_type == OrderTypeEnum.photographer_only
+
+    def test_client_order_type_mismatch_is_ignored(self):
+        """Клиент может прислать combined, сервер всё равно выведет тип из items."""
+
+        order = OrderCreate(
+            order_type=OrderTypeEnum.combined,
+            items=[
+                OrderItemCreate(
+                    resource_type="photographer",
+                    resource_id=123,
+                    start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
+                    end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+                )
+            ],
+            prepayment_amount=Decimal("5000.00"),
+        )
+
+        assert order.derived_order_type == OrderTypeEnum.photographer_only
+
+    def test_empty_items_rejected(self):
+        """Заказ без позиций отклоняется на уровне схемы."""
+
+        with pytest.raises(ValidationError):
+            OrderCreate(items=[], prepayment_amount=Decimal("5000.00"))
 
 
 # ============================================================================
@@ -221,85 +252,68 @@ class TestOrderSchemaValidation:
 # ============================================================================
 
 class TestAvailabilityCheckerService:
-    """Тесты сервиса проверки доступности слотов."""
-    
+    """Тесты диспетчера проверки доступности ресурсов."""
+
+    def test_dispatcher_has_known_types(self):
+        """В диспетчере есть чекеры для поддерживаемых типов ресурсов."""
+        assert "photographer" in AVAILABILITY_CHECKERS
+        assert "studio_room" in AVAILABILITY_CHECKERS
+
     @pytest.mark.asyncio
-    async def test_check_slot_availability_no_conflicts(self, mock_db_session):
-        """Проверяет что свободный слот считается доступным."""
-        
-        # Моким все проверки как успешные
-        with patch.object(
-            AvailabilityCheckerService,
-            '_check_conflicts',
-            return_value=None,
+    async def test_available_slot_passes(self, mock_db_session):
+        """Свободный слот не вызывает исключений."""
+        with patch.dict(
+            AVAILABILITY_CHECKERS,
+            {"photographer": AsyncMock(return_value=None)},
         ):
-            with patch.object(
-                AvailabilityCheckerService,
-                '_check_schedule_blocks',
-                return_value=False,
-            ):
-                with patch.object(
-                    AvailabilityCheckerService,
-                    '_check_schedule_exceptions',
-                    return_value=False,
-                ):
-                    is_available, message = await AvailabilityCheckerService.check_slot_availability(
-                        db=mock_db_session,
-                        photographer_id=123,
-                        studio_room_id=None,
-                        start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
-                        end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
-                    )
-                    
-                    assert is_available is True
-                    assert "доступен" in message
-    
+            item = OrderItemCreate(
+                resource_type="photographer",
+                resource_id=123,
+                start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
+                end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+            )
+
+            # Не должно быть исключения
+            await validate_items_availability(db=mock_db_session, items=[item])
+
     @pytest.mark.asyncio
-    async def test_check_slot_availability_conflict_raises_error(self, mock_db_session):
-        """Проверяет что конфликт слотов вызывает SlotConflictError."""
-        
-        with patch.object(
-            AvailabilityCheckerService,
-            '_check_conflicts',
-            return_value=999,  # ID конфликтующего заказа
-        ):
-            with pytest.raises(SlotConflictError) as exc_info:
-                await AvailabilityCheckerService.check_slot_availability(
-                    db=mock_db_session,
-                    photographer_id=123,
-                    studio_room_id=None,
-                    start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
-                    end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
-                )
-            
+    async def test_conflict_raises_409(self, mock_db_session):
+        """Конфликт слота даёт HTTP 409."""
+        from fastapi import HTTPException
+
+        checker = AsyncMock(
+            side_effect=HTTPException(status_code=409, detail="Слот занят")
+        )
+        with patch.dict(AVAILABILITY_CHECKERS, {"photographer": checker}):
+            item = OrderItemCreate(
+                resource_type="photographer",
+                resource_id=123,
+                start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
+                end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+            )
+
+            with pytest.raises(HTTPException) as exc_info:
+                await validate_items_availability(db=mock_db_session, items=[item])
+
             assert exc_info.value.status_code == 409
-            assert exc_info.value.conflicting_order_id == 999
-    
+
     @pytest.mark.asyncio
-    async def test_check_slot_availability_blocked_raises_error(self, mock_db_session):
-        """Проверяет что заблокированный слот вызывает ScheduleBlockedException."""
-        
-        with patch.object(
-            AvailabilityCheckerService,
-            '_check_conflicts',
-            return_value=None,
-        ):
-            with patch.object(
-                AvailabilityCheckerService,
-                '_check_schedule_blocks',
-                return_value=True,
-            ):
-                with pytest.raises(ScheduleBlockedException) as exc_info:
-                    await AvailabilityCheckerService.check_slot_availability(
-                        db=mock_db_session,
-                        photographer_id=123,
-                        studio_room_id=None,
-                        start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
-                        end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
-                    )
-                
-                assert exc_info.value.status_code == 403
-                assert exc_info.value.blocked_by == "schedule_block"
+    async def test_unknown_resource_type_raises_400(self, mock_db_session):
+        """Неизвестный resource_type даёт HTTP 400."""
+        from fastapi import HTTPException
+
+        item = OrderItemCreate(
+            resource_type="lighting_rig",
+            resource_id=1,
+            start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
+            end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await validate_items_availability(db=mock_db_session, items=[item])
+
+        assert exc_info.value.status_code == 400
+        assert "lighting_rig" in str(exc_info.value.detail)
 
 
 # ============================================================================
@@ -399,15 +413,14 @@ class TestOrderService:
         mock_order.total_price = Decimal("5000.00")
         mock_order.prepayment_amount = Decimal("5000.00")
         
-        with patch.object(
-            AvailabilityCheckerService,
-            'check_slot_availability',
-            return_value=None,  # Нет конфликтов
+        with patch(
+            "app.services.orders.services.validate_items_availability",
+            new=AsyncMock(return_value=None),
         ):
             with patch.object(
                 OrderService,
                 '_collect_snapshot',
-                return_value={sample_order_create_data.items[0]: {"fixed_price": Decimal("5000.00")}},
+                return_value={0: {"fixed_price": Decimal("5000.00"), "conditions": {}}},
             ):
                 mock_db_session.add = MagicMock()
                 mock_db_session.flush = AsyncMock()
@@ -510,7 +523,8 @@ async def test_full_order_lifecycle(db_session: AsyncSession):
         order_type=OrderTypeEnum.photographer_only,
         items=[
             OrderItemCreate(
-                photographer_id=123,
+                resource_type="photographer",
+                resource_id=123,
                 start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                 end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
             )
@@ -543,7 +557,8 @@ class TestEdgeCases:
         
         with pytest.raises(ValueError) as exc_info:
             OrderItemCreate(
-                photographer_id=123,
+                resource_type="photographer",
+                resource_id=123,
                 start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                 end_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),  # То же время
             )
@@ -558,7 +573,8 @@ class TestEdgeCases:
                 order_type=OrderTypeEnum.photographer_only,
                 items=[
                     OrderItemCreate(
-                        photographer_id=123,
+                        resource_type="photographer",
+                        resource_id=123,
                         start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                         end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
                     )
@@ -573,7 +589,8 @@ class TestEdgeCases:
         
         with pytest.raises(ValueError) as exc_info:
             OrderItemCreate(
-                photographer_id=123,
+                resource_type="photographer",
+                resource_id=123,
                 start_time=datetime(2026, 10, 15, 10, 0),  # Без timezone
                 end_time=datetime(2026, 10, 15, 14, 0),   # Без timezone
             )
@@ -595,7 +612,8 @@ async def test_order_creation_performance(mock_db_session):
         order_type=OrderTypeEnum.photographer_only,
         items=[
             OrderItemCreate(
-                photographer_id=123,
+                resource_type="photographer",
+                resource_id=123,
                 start_time=datetime.fromisoformat("2026-10-15T10:00:00+03:00"),
                 end_time=datetime.fromisoformat("2026-10-15T14:00:00+03:00"),
             )
@@ -606,10 +624,9 @@ async def test_order_creation_performance(mock_db_session):
     start_time = time.time()
     
     # Выполняем создание заказа (mocked)
-    with patch.object(
-        AvailabilityCheckerService,
-        'check_slot_availability',
-        return_value=None,
+    with patch(
+        "app.services.orders.services.validate_items_availability",
+        new=AsyncMock(return_value=None),
     ):
         await OrderService.create_order(
             db=mock_db_session,
