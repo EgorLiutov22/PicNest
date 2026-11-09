@@ -52,7 +52,11 @@ from app.services.orders.services import (
     OrderForbiddenError,
     OrderValidationError,
 )
-from app.services.schedule.occupancy import SlotTakenError, release_order
+from app.services.schedule.occupancy import (
+    SlotTakenError,
+    confirm_order_occupancy,
+    release_order,
+)
 
 
 
@@ -642,7 +646,11 @@ async def confirm_order(
             new_status=DBOrderStatus.confirmed,
             actor_type="performer",  # Исполнитель подтверждает
         )
-        
+
+        # Подтверждённая бронь перестаёт быть холдом: без снятия TTL фоновая
+        # чистка освободила бы оплаченный слот по истечении 15 минут.
+        await confirm_order_occupancy(db, order.id)
+
         # Фиксируем изменения в БД
         await db.flush()
         await db.refresh(order)

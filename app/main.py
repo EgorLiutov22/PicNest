@@ -212,6 +212,10 @@ async def metrics_endpoint(request: Request):
 
 
 from app.core.config import get_settings
+from app.services.schedule.sweeper import (
+    start_occupancy_sweeper,
+    stop_occupancy_sweeper,
+)
 settings = get_settings()
 
 def _split_csv(value: str | None, default: list[str]) -> list[str]:
@@ -501,11 +505,12 @@ async def health_check():
 @app.on_event("startup")
 async def startup():
     """Инициализация приложения при запуске.
-    
+
     Выполняется один раз при старте сервера:
     - Настройка логгера (структурированное логирование)
     - Инициализация базы данных
     - Инициализация Sentry (если настроен SENTRY_DSN)
+    - Запуск фоновой чистки просроченных холдов брони
     """
     
     from app.core.logging import setup_app_logging, get_logger
@@ -548,6 +553,14 @@ async def startup():
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
+
+    start_occupancy_sweeper(settings)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Останавливает фоновые задачи перед завершением процесса."""
+    await stop_occupancy_sweeper()
 
 
 

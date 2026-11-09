@@ -246,6 +246,28 @@ async def release_order(db: AsyncSession, order_id: int) -> int:
     return result.rowcount or 0
 
 
+async def confirm_order_occupancy(db: AsyncSession, order_id: int) -> int:
+    """Снимает TTL холда: подтверждённая бронь держит слот бессрочно.
+
+    Без этого expire_stale_holds освободил бы оплаченный слот через
+    HOLD_TTL после создания заказа.
+    """
+    result = await db.execute(
+        text(
+            """
+            UPDATE resource_occupancy AS ro
+            SET expires_at = NULL
+            FROM order_items AS oi
+            WHERE ro.order_item_id = oi.id
+              AND oi.order_id = :order_id
+              AND ro.released_at IS NULL
+            """
+        ),
+        {"order_id": order_id},
+    )
+    return result.rowcount or 0
+
+
 async def expire_stale_holds(db: AsyncSession, limit: int = 500) -> int:
     """Снимает истёкшие холды неоплаченных заказов.
 

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     LOG_LEVEL: str = "INFO"
 
+    # Фоновая чистка просроченных холдов брони.
+    OCCUPANCY_SWEEP_ENABLED: bool = True
+    OCCUPANCY_SWEEP_INTERVAL_SECONDS: int = 60
+
 
 @lru_cache()
 def get_settings() -> Settings:
